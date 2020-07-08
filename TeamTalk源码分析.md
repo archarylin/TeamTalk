@@ -308,7 +308,7 @@ int init_proxy_conn(uint32_t thread_num)
 {
 	s_handler_map = CHandlerMap::getInstance();//2.命令和函数映射
 	g_thread_pool.Init(thread_num);//1.初始化线程池
-	netlib_add_loop(proxy_loop_callback, NULL);//添加网络事件处理函数
+	netlib_add_loop(proxy_loop_callback, NULL);//添加网络事件处理函数，后面分析可以知道，实际上注册了响应客户端的回调函数
 	signal(SIGTERM, sig_handler);//注册终止信息
 	return netlib_register_timer(proxy_timer_callback, NULL, 1000);
 }
@@ -789,6 +789,7 @@ while(退出条件)
     //可写
     //异常
     //定时器
+    //其他事件(如响应客户端)
 }
 
 //监听服务器事件，并进行处理
@@ -842,7 +843,7 @@ void CEventDispatch::StartDispatch(uint32_t wait_timeout)
 	}
 }
 ````
-​		新客户端连接。
+##### 新客户端连接|读事件
 
 ````c
 void CBaseSocket::_AcceptNewSocket()
@@ -866,7 +867,7 @@ void CBaseSocket::_AcceptNewSocket()
 		pSocket->SetRemotePort(port);//set remote port
 		_SetNoDelay(fd);//设置TCP_NODELAY,即禁用Nagle算法，允许小包发送，适合数据包比较小的场景。Nagle算法，只有写缓冲达到一定量的时候才会写出。
 		_SetNonblock(fd);//no block
-		AddBaseSocket(pSocket);//
+		AddBaseSocket(pSocket);//添加到g_socket_map
 		CEventDispatch::Instance()->AddEvent(fd, SOCKET_READ | SOCKET_EXCEP);//添加可读和异常事件
 		m_callback(m_callback_data, NETLIB_MSG_CONNECT, (net_handle_t)fd, NULL);//设置回调事件，也就是proxy_serv_callback
 	}
@@ -894,7 +895,7 @@ void CProxyConn::OnConnect(net_handle_t handle)//fd
 	g_proxy_conn_map.insert(make_pair(handle, this));
 
 	netlib_option(handle, NETLIB_OPT_SET_CALLBACK, (void*)imconn_callback);//修改回调函数为imconn_callback
-	netlib_option(handle, NETLIB_OPT_SET_CALLBACK_DATA, (void*)&g_proxy_conn_map);
+	netlib_option(handle, NETLIB_OPT_SET_CALLBACK_DATA, (void*)&g_proxy_conn_map);//传入map<fd,proxy_connection>
 	netlib_option(handle, NETLIB_OPT_GET_REMOTE_IP, (void*)&m_peer_ip);
 	netlib_option(handle, NETLIB_OPT_GET_REMOTE_PORT, (void*)&m_peer_port);
 
@@ -914,8 +915,8 @@ void imconn_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pP
 	NOTUSED_ARG(pParam);
 	if (!callback_data)
 		return;
-	ConnMap_t* conn_map = (ConnMap_t*)callback_data;
-	CImConn* pConn = FindImConn(conn_map, handle);
+	ConnMap_t* conn_map = (ConnMap_t*)callback_data;//map<fd,proxy_connection>
+	CImConn* pConn = FindImConn(conn_map, handle);//proxyconnection继承CImConn，class CProxyConn : public CImConn {...},并且含有虚函数因此可以使用多态。
 	if (!pConn)
 		return;
 	//log("msg=%d, handle=%d ", msg, handle);
@@ -939,37 +940,501 @@ void imconn_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pP
 	}
 	pConn->ReleaseRef();
 }
+////////////////////////////////////////////////////////
+// 上面提到fd对应一个 CProxyConn，实际上，map<fd,connection>中的connect是 CImConn 类型。
 ````
 
 ​		处理可读事件。
 
 ````c
-#define closesocket close
-#define ioctlsocket ioctl
-void CBaseSocket::OnRead()
+// 
+// 由于数据包是在另一个线程处理的，所以不能在主线程delete数据包，所以需要Override这个方法
+// CProxyConn继承于CImConn，每一路CImConn都有自己独立的读缓冲区，和写缓冲区。
+void CProxyConn::OnRead()
 {
-	if (m_state == SOCKET_STATE_LISTENING)//serverfd
-	{
-		_AcceptNewSocket();
+	for (;;) 
+    {
+		uint32_t free_buf_len = m_in_buf.GetAllocSize() - m_in_buf.GetWriteOffset();//获得读缓冲区的剩余空间
+		if (free_buf_len < READ_BUF_SIZE)
+			m_in_buf.Extend(READ_BUF_SIZE);//空间不足则拓展
+		int ret = netlib_recv(m_handle, m_in_buf.GetBuffer() + m_in_buf.GetWriteOffset(), READ_BUF_SIZE);
+		if (ret <= 0)//读取完成
+			break;
+		m_recv_bytes += ret;
+		m_in_buf.IncWriteOffset(ret);//写入读缓冲区
+		m_last_recv_tick = get_tick_count();//计时
 	}
-	else//clientfd
-	{	
-		u_long avail = 0;
-		if ( (ioctlsocket(m_socket, FIONREAD, &avail) == SOCKET_ERROR) || (avail == 0) )
-		{
-			m_callback(m_callback_data, NETLIB_MSG_CLOSE, (net_handle_t)m_socket, NULL);//close
-		}
-		else
-		{
-			m_callback(m_callback_data, NETLIB_MSG_READ, (net_handle_t)m_socket, NULL);//read
-		}
-	}
+	uint32_t pdu_len = 0;
+    try {
+        while ( CImPdu::IsPduAvailable(m_in_buf.GetBuffer(), m_in_buf.GetWriteOffset(), pdu_len) ) {//读取包长度
+            HandlePduBuf(m_in_buf.GetBuffer(), pdu_len);//处理读包中的命令
+            m_in_buf.Read(NULL, pdu_len);//处理完成后会将已读数据删除
+        }
+    } catch (CPduException& ex) {
+        log("!!!catch exception, err_code=%u, err_msg=%s, close the connection ",
+            ex.GetErrorCode(), ex.GetErrorMsg());
+        OnClose();
+    }
+	
 }
 ````
 
-​		处理可写事件。
+​		处理协议包。从读缓冲区里读取数据，转换成协议包，再生成一个包任务，添加到线程池的任务队列处理。
 
 ````c
+CImPdu{
+    ...
+    CSimpleBuffer	m_buf;
+    PduHeader_t		m_pdu_header;//消息头
+    ...
+}
+typedef struct {
+    uint32_t 	length;		  // the whole pdu length
+    uint16_t 	version;	  // pdu version number
+    uint16_t	flag;		  // not used
+    uint16_t	service_id;	  //
+    uint16_t	command_id;	  //
+    uint16_t	seq_num;     // 包序号
+    uint16_t    reversed;    // 保留
+} PduHeader_t;
+
+void CProxyConn::HandlePduBuf(uchar_t* pdu_buf, uint32_t pdu_len)
+{
+    CImPdu* pPdu = NULL;//Instant message protocol data unit , 即时通信消息协议数据单元，即一个协议包
+    pPdu = CImPdu::ReadPdu(pdu_buf, pdu_len);//读取
+    if (pPdu->GetCommandId() == IM::BaseDefine::CID_OTHER_HEARTBEAT) {//心跳包，不进行处理
+        return;
+    }
+    
+    pdu_handler_t handler = s_handler_map->GetHandler(pPdu->GetCommandId());//
+    
+    if (handler) {
+        CTask* pTask = new CProxyTask(m_uuid, handler, pPdu);//生成一个包处理任务
+        g_thread_pool.AddTask(pTask);//添加到线程池任务队列处理
+    } else {
+        log("no handler for packet type: %d", pPdu->GetCommandId());
+    }
+}
+````
+
+​		线程池会将任务随机丢到一个任务队列处理。
+
+````c
+void CThreadPool::AddTask(CTask* pTask)
+{
+	/*
+	 * select a random thread to push task
+	 * we can also select a thread that has less task to do
+	 * but that will scan the whole thread list and use thread lock to get each task size
+	 */
+	uint32_t thread_idx = random() % m_worker_size;
+	m_worker_list[thread_idx].PushTask(pTask);
+}
+````
+
+​		由以上的读取包的流程，可以得出以下的伪码：
+
+````c
+while(退出条件)
+{
+    //监听socket 可读事件
+    //执行读回调函数
+    //accept时，生成CBaseSocket,添加到g_socket_map;重定位回调函数
+    //read时，生成CProxyConn,添加到 g_proxy_conn_map.执行回调函数，将数据写入m_in_buf(读缓冲区),数据长度不足包头大小，跳出循环。从包头获得包体大小，若缓冲区无法满足包头+包体大小，跳出循环，否则开始解包。根据包命令处理数据，并转换成一个任务，传递给任务队列执行。
+    //清除刚才处理的数据。
+}
+````
+
+​		
+
+##### 消息响应
+
+对于任务队列处理完数据后的应答流程，以登录数据包来进行分析。
+
+````C
+void CHandlerMap::Init()
+{
+    //DB_PROXY是命名空间，不是类名
+	// Login validate
+	m_handler_map.insert(make_pair(uint32_t(CID_OTHER_VALIDATE_REQ), DB_PROXY::doLogin));
+    ...
+}
+//login
+void doLogin(CImPdu* pPdu, uint32_t conn_uuid)
+{
+    
+    CImPdu* pPduResp = new CImPdu;
+    
+    IM::Server::IMValidateReq msg;//请求消息
+    IM::Server::IMValidateRsp msgResp;//响应消息
+    if(msg.ParseFromArray(pPdu->GetBodyData(), pPdu->GetBodyLength()))
+    {
+        
+        string strDomain = msg.user_name();//用户名称
+        string strPass = msg.password();//用户密码
+        
+        msgResp.set_user_name(strDomain);//响应用户名称
+        msgResp.set_attach_data(msg.attach_data());//响应数据
+        
+        do
+        {
+            CAutoLock cAutoLock(&g_cLimitLock);
+            list<uint32_t>& lsErrorTime = g_hmLimits[strDomain];
+            uint32_t tmNow = time(NULL);
+            
+            //清理超过30分钟的错误时间点记录
+            /*
+             清理放在这里还是放在密码错误后添加的时候呢？
+             放在这里，每次都要遍历，会有一点点性能的损失。
+             放在后面，可能会造成30分钟之前有10次错的，但是本次是对的就没办法再访问了。
+             */
+            auto itTime=lsErrorTime.begin();
+            for(; itTime!=lsErrorTime.end();++itTime)//遍历所有的错误的时间，30分钟之前有错误，退出遍历。
+            {
+                if(tmNow - *itTime > 30*60)
+                {
+                    break;
+                }
+            }
+            if(itTime != lsErrorTime.end())//中途存在30分钟之前的错误，则将错误删除
+            {
+                lsErrorTime.erase(itTime, lsErrorTime.end());
+            }
+            // 判断30分钟内密码错误次数是否大于10
+            if(lsErrorTime.size() > 10)
+            {
+                itTime = lsErrorTime.begin();
+                if(tmNow - *itTime <= 30*60)
+                {
+                    msgResp.set_result_code(6);
+                    msgResp.set_result_string("用户名/密码错误次数太多");
+                    pPduResp->SetPBMsg(&msgResp);
+                    pPduResp->SetSeqNum(pPdu->GetSeqNum());
+                    pPduResp->SetServiceId(IM::BaseDefine::SID_OTHER);
+                    pPduResp->SetCommandId(IM::BaseDefine::CID_OTHER_VALIDATE_RSP);
+                    CProxyConn::AddResponsePdu(conn_uuid, pPduResp);//添加错误响应包
+                    return ;
+                }
+            }
+        } while(false);
+        //登录
+        log("%s request login.", strDomain.c_str());
+        IM::BaseDefine::UserInfo cUser;
+        if(g_loginStrategy.doLogin(strDomain, strPass, cUser))//1.从MySQL数据库获取数据，进行用户名和密码校验
+        {
+            IM::BaseDefine::UserInfo* pUser = msgResp.mutable_user_info();
+            pUser->set_user_id(cUser.user_id());
+            pUser->set_user_gender(cUser.user_gender());
+            pUser->set_department_id(cUser.department_id());
+            pUser->set_user_nick_name(cUser.user_nick_name());
+            pUser->set_user_domain(cUser.user_domain());
+            pUser->set_avatar_url(cUser.avatar_url());
+            pUser->set_email(cUser.email());
+            pUser->set_user_tel(cUser.user_tel());
+            pUser->set_user_real_name(cUser.user_real_name());
+            pUser->set_status(0);
+            pUser->set_sign_info(cUser.sign_info());
+            msgResp.set_result_code(0);//result code
+            msgResp.set_result_string("成功");//result string
+            //如果登陆成功，则清除错误尝试限制
+            CAutoLock cAutoLock(&g_cLimitLock);
+            list<uint32_t>& lsErrorTime = g_hmLimits[strDomain];
+            lsErrorTime.clear();
+        }
+        else//错误，记录一次错误
+        {
+            //密码错误，记录一次登陆失败
+            uint32_t tmCurrent = time(NULL);
+            CAutoLock cAutoLock(&g_cLimitLock);
+            list<uint32_t>& lsErrorTime = g_hmLimits[strDomain];
+            lsErrorTime.push_front(tmCurrent);
+            
+            log("get result false");
+            msgResp.set_result_code(1);
+            msgResp.set_result_string("用户名/密码错误");
+        }
+    }
+    else
+    {
+        msgResp.set_result_code(2);
+        msgResp.set_result_string("服务端内部错误");
+    }
+    pPduResp->SetPBMsg(&msgResp);
+    pPduResp->SetSeqNum(pPdu->GetSeqNum());
+    pPduResp->SetServiceId(IM::BaseDefine::SID_OTHER);
+    pPduResp->SetCommandId(IM::BaseDefine::CID_OTHER_VALIDATE_RSP);
+    CProxyConn::AddResponsePdu(conn_uuid, pPduResp);//2.添加消息响应
+}
+````
+
+​		1.用户名和密码的校验
+
+````c
+bool CInterLoginStrategy::doLogin(const std::string &strName, const std::string &strPass, IM::BaseDefine::UserInfo& user)
+{
+    bool bRet = false;
+    CDBManager* pDBManger = CDBManager::getInstance();
+    CDBConn* pDBConn = pDBManger->GetDBConn("teamtalk_slave");//从数据库获得一个连接
+    if (pDBConn) {
+        string strSql = "select * from IMUser where name='" + strName + "' and status=0";//MySQL查询语句
+        CResultSet* pResultSet = pDBConn->ExecuteQuery(strSql.c_str());//进行查询
+        if(pResultSet)
+        {
+            string strResult, strSalt;
+            uint32_t nId, nGender, nDeptId, nStatus;
+            string strNick, strAvatar, strEmail, strRealName, strTel, strDomain,strSignInfo;
+            while (pResultSet->Next()) {
+                nId = pResultSet->GetInt("id");
+                strResult = pResultSet->GetString("password");
+                strSalt = pResultSet->GetString("salt");
+                strNick = pResultSet->GetString("nick");
+                nGender = pResultSet->GetInt("sex");
+                strRealName = pResultSet->GetString("name");
+                strDomain = pResultSet->GetString("domain");
+                strTel = pResultSet->GetString("phone");
+                strEmail = pResultSet->GetString("email");
+                strAvatar = pResultSet->GetString("avatar");
+                nDeptId = pResultSet->GetInt("departId");
+                nStatus = pResultSet->GetInt("status");
+                strSignInfo = pResultSet->GetString("sign_info");
+            }
+            string strInPass = strPass + strSalt;//密码+混淆码
+            char szMd5[33];
+            CMd5::MD5_Calculate(strInPass.c_str(), strInPass.length(), szMd5);
+            string strOutPass(szMd5);
+            //去掉密码校验
+            //if(strOutPass == strResult)
+            {
+                bRet = true;
+                user.set_user_id(nId);
+                user.set_user_nick_name(strNick);
+                user.set_user_gender(nGender);
+                user.set_user_real_name(strRealName);
+                user.set_user_domain(strDomain);
+                user.set_user_tel(strTel);
+                user.set_email(strEmail);
+                user.set_avatar_url(strAvatar);
+                user.set_department_id(nDeptId);
+                user.set_status(nStatus);
+  	        	user.set_sign_info(strSignInfo);
+            }
+            delete  pResultSet;
+        }
+        pDBManger->RelDBConn(pDBConn);//归还数据库的连接
+    }
+    return bRet;
+}
+````
+
+​		2.消息的响应
+
+````c
+void CProxyConn::AddResponsePdu(uint32_t conn_uuid, CImPdu* pPdu)
+{
+	ResponsePdu_t* pResp = new ResponsePdu_t;//创建一个响应
+	pResp->conn_uuid = conn_uuid;
+	pResp->pPdu = pPdu;//x协议包
+	s_list_lock.lock();
+	s_response_pdu_list.push_back(pResp);//添加到CProxyConn对象的回复队列。
+	s_list_lock.unlock();
+}
+````
+
+​		至于s_response_pdu_list队列里面的怎么发送出去，可以查看下面
+
+````c
+init_proxy_conn(thread_num);
+int init_proxy_conn(uint32_t thread_num)
+{
+	s_handler_map = CHandlerMap::getInstance();
+	g_thread_pool.Init(thread_num);
+	netlib_add_loop(proxy_loop_callback, NULL);//重点
+	signal(SIGTERM, sig_handler);
+	return netlib_register_timer(proxy_timer_callback, NULL, 1000);
+}
+
+//
+int netlib_add_loop(callback_t callback, void* user_data)
+{
+	CEventDispatch::Instance()->AddLoop(callback, user_data);
+	return 0;
+}
+//向m_loop_list添加一个item处理项。
+void CEventDispatch::AddLoop(callback_t callback, void* user_data)//proxy_loop_callback
+{
+    TimerItem* pItem = new TimerItem;
+    pItem->callback = callback;//Item设置回调函数
+    pItem->user_data = user_data;
+    m_loop_list.push_back(pItem);//将item添加到m_loop_list
+}
+//被注册的回调函数
+void proxy_loop_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pParam)
+{
+	CProxyConn::SendResponsePduList();
+}
+//实际上执行的函数
+void CProxyConn::SendResponsePduList()
+{
+	s_list_lock.lock();
+    //一旦队列不为空，就会取出响应队列的数据
+	while (!s_response_pdu_list.empty()) {
+		ResponsePdu_t* pResp = s_response_pdu_list.front();
+		s_response_pdu_list.pop_front();
+		s_list_lock.unlock();
+		CProxyConn* pConn = get_proxy_conn_by_uuid(pResp->conn_uuid);//获得uuid对应的CProxyConn
+		if (pConn) {
+			if (pResp->pPdu) {
+				pConn->SendPdu(pResp->pPdu);//3.通过CProxyConn发送消息
+			} else {
+				log("close connection uuid=%d by parse pdu error\b", pResp->conn_uuid);
+				pConn->Close();
+			}
+		}
+		if (pResp->pPdu)//删除响应消息
+			delete pResp->pPdu;
+		delete pResp;//删除响应
+
+		s_list_lock.lock();
+	}
+	s_list_lock.unlock();
+}
+````
+
+​		而什么时候发送执行这个回调函数，可以看
+
+````c
+//事件分发函数
+void CEventDispatch::StartDispatch(uint32_t wait_timeout)
+{
+    ...
+   	_CheckTimer();
+	_CheckLoop();
+    ...
+}
+//检查是否有其他事件需要执行
+void CEventDispatch::_CheckLoop()
+{
+    for (list<TimerItem*>::iterator it = m_loop_list.begin(); it != m_loop_list.end(); it++) {
+        TimerItem* pItem = *it;//取出item
+        pItem->callback(pItem->user_data, NETLIB_MSG_LOOP, 0, NULL);//执行item的回调函数
+    }
+}
+````
+
+##### 消息的发送
+
+​		如果无法发送完，会将数据写到发送缓冲区，并设置m_busy标志，同时添加可写事件监听。（但是它在WIN和APPLE平台都设置的事件监听，唯独Linux平台没有设置监听）。
+
+````c
+CProxyConn* pConn = get_proxy_conn_by_uuid(pResp->conn_uuid);
+pConn->SendPdu(pResp->pPdu);
+//
+class CImConn : public CRefObject
+{
+    ...
+    int SendPdu(CImPdu* pPdu) { return Send(pPdu->GetBuffer(), pPdu->GetLength()); }
+    ...
+}
+//send
+int CImConn::Send(void* data, int len)
+{
+	m_last_send_tick = get_tick_count();//记录最后的发送事件
+//	++g_send_pkt_cnt;
+	if (m_busy)//如果仍让忙碌，则将数据写入发送缓冲区
+	{
+		m_out_buf.Write(data, len);
+		return len;
+	}
+
+	int offset = 0;
+	int remain = len;
+	while (remain > 0) {//只要还剩下就继续发
+		int send_size = remain;
+		if (send_size > NETLIB_MAX_SOCKET_BUF_SIZE) {//每次最多发送NETLIB_MAX_SOCKET_BUF_SIZE=(128 * 1024) 128k
+			send_size = NETLIB_MAX_SOCKET_BUF_SIZE;
+		}
+		int ret = netlib_send(m_handle, (char*)data + offset , send_size);//发送
+		if (ret <= 0) {//出错
+			ret = 0;
+			break;
+		}
+		offset += ret;
+		remain -= ret;
+	}
+	if (remain > 0)//检查remain判断是否正常
+	{
+		m_out_buf.Write((char*)data + offset, remain);//不正常则将数据写入发送缓冲区
+		m_busy = true;//置忙碌标记
+		log("send busy, remain=%d ", m_out_buf.GetWriteOffset());
+	}
+    else
+    {
+        OnWriteCompelete();//执行发送完成函数，虚函数，会被继承覆盖
+    }
+	return len;
+}
+//底层的send
+int netlib_send(net_handle_t handle, void* buf, int len)
+{
+	CBaseSocket* pSocket = FindBaseSocket(handle);
+	if (!pSocket)
+	{
+		return NETLIB_ERROR;
+	}
+	int ret = pSocket->Send(buf, len);
+	pSocket->ReleaseRef();
+	return ret;
+}
+int CBaseSocket::Send(void* buf, int len)
+{
+	if (m_state != SOCKET_STATE_CONNECTED)
+		return NETLIB_ERROR;
+
+	int ret = send(m_socket, (char*)buf, len, 0);
+	if (ret == SOCKET_ERROR)
+	{
+		int err_code = _GetErrorCode();
+		if (_IsBlock(err_code))//阻塞，说明发送错误
+		{
+#if ((defined _WIN32) || (defined __APPLE__))
+			CEventDispatch::Instance()->AddEvent(m_socket, SOCKET_WRITE);//添加可写事件，为什么linux平台就不添加可写事件?这很奇怪
+#endif
+			ret = 0;
+			//log("socket send block fd=%d", m_socket);
+		}
+		else
+		{
+			log("!!!send failed, error code: %d", err_code);
+		}
+	}
+	return ret;
+}
+//is block
+bool CBaseSocket::_IsBlock(int error_code)
+{
+#ifdef _WIN32
+	return ( (error_code == WSAEINPROGRESS) || (error_code == WSAEWOULDBLOCK) );
+#else
+	return ( (error_code == EINPROGRESS) || (error_code == EWOULDBLOCK) );
+#endif
+}
+````
+
+​		剩下的无法发送的有epoll_wait监听可写事件
+
+````c
+void CEventDispatch::StartDispatch(uint32_t wait_timeout)
+{
+    nfds = epoll_wait(m_epfd, events, 1024, wait_timeout);
+    ...
+    if (events[i].events & EPOLLOUT)
+    {
+        //log("OnWrite, socket=%d\n", ev_fd);
+        pSocket->OnWrite();
+    }
+    ...
+}
+//执行CBaseSocket的write函数
 void CBaseSocket::OnWrite()
 {
 #if ((defined _WIN32) || (defined __APPLE__))
@@ -996,7 +1461,177 @@ void CBaseSocket::OnWrite()
 		m_callback(m_callback_data, NETLIB_MSG_WRITE, (net_handle_t)m_socket, NULL);
 	}
 }
+
+//这里在客户端连接的时候就已经将回调函数重定位了
+void CProxyConn::OnConnect(net_handle_t handle)//fd
+{
+    ...
+	netlib_option(handle, NETLIB_OPT_SET_CALLBACK, (void*)imconn_callback);//修改回调函数为imconn_callback
+    ...
+}
+//可以参考这里的函数
+void imconn_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pParam)
+{
+    ...
+	ConnMap_t* conn_map = (ConnMap_t*)callback_data;//map<fd,proxy_connection>
+	CImConn* pConn = FindImConn(conn_map, handle);
+    ...
+	switch (msg)
+	{
+	...
+	case NETLIB_MSG_WRITE:
+		pConn->OnWrite();
+		break;
+	...
+	}
+	...
+}
+
+//因此实际还是执行了
+void CImConn::OnWrite()
+{
+	if (!m_busy)//如果不忙碌了，直接返回，这里只有无法发送出去的时候才会重新发送
+		return;
+	while (m_out_buf.GetWriteOffset() > 0) {//
+		int send_size = m_out_buf.GetWriteOffset();
+		if (send_size > NETLIB_MAX_SOCKET_BUF_SIZE) {//NETLIB_MAX_SOCKET_BUF_SIZE=(128 * 1024)
+			send_size = NETLIB_MAX_SOCKET_BUF_SIZE;
+		}
+		int ret = netlib_send(m_handle, m_out_buf.GetBuffer(), send_size);//发送，如果还是无法发送，继续注册监听发送事件
+		if (ret <= 0) {
+			ret = 0;
+			break;
+		}
+		m_out_buf.Read(NULL, ret);//发送成功，清除掉已发送的数据
+	}
+	if (m_out_buf.GetWriteOffset() == 0) {//发送缓冲区已清理，清除忙碌标志
+		m_busy = false;
+	}
+	log("onWrite, remain=%d ", m_out_buf.GetWriteOffset());
+}
+//////////////////////////////////////////
+// 因此，对于发送流程，可以总结
+// 1.将响应数据丢到其他任务队列中。
+// 2.epoll_执行完毕后，处理其他任务队列,执行其他任务队列的回调函数
+// 3.找到响应对应的CProxyConn，执行数据发送
+// 4.先一次性发送数据，若无法发出错，则将数据写到发送缓冲区，并注册监听可写事件
+// 5.epoll监听到可写事件，则将发送缓冲区的数据继续发送出去，如果还是无法发送全部，则继续注册可写事件....直到全部数据发送出去。
+// 6.数据全部发送出去，取消可写事件监听，避免无数据可写也触发可写事件(实际上很频繁我的)！
 ````
+
+##### 心跳包的处理
+
+````c
+int init_proxy_conn(uint32_t thread_num)
+{
+	...
+	return netlib_register_timer(proxy_timer_callback, NULL, 1000);
+}
+//注册定时器回调函数proxy_timer_callback
+int netlib_register_timer(callback_t callback, void* user_data, uint64_t interval)
+{
+	CEventDispatch::Instance()->AddTimer(callback, user_data, interval);
+	return 0;
+}
+//
+void CEventDispatch::AddTimer(callback_t callback, void* user_data, uint64_t interval)
+{
+	list<TimerItem*>::iterator it;
+	for (it = m_timer_list.begin(); it != m_timer_list.end(); it++)//遍历所有定时器，若已经存在这样的定时器，则更新定时器
+	{
+		TimerItem* pItem = *it;
+		if (pItem->callback == callback && pItem->user_data == user_data)
+		{
+			pItem->interval = interval;
+			pItem->next_tick = get_tick_count() + interval;
+			return;
+		}
+	}
+	TimerItem* pItem = new TimerItem;//创建定时器
+	pItem->callback = callback;//设置回调函数
+	pItem->user_data = user_data;
+	pItem->interval = interval;
+	pItem->next_tick = get_tick_count() + interval;
+	m_timer_list.push_back(pItem);//添加到定时器队列
+}
+````
+
+​		在IO事件监听事件处理循环里
+
+````c
+void CEventDispatch::StartDispatch(uint32_t wait_timeout)
+{    
+	while (running)
+	{
+		nfds = epoll_wait(m_epfd, events, 1024, wait_timeout);
+		for (int i = 0; i < nfds; i++)
+		{
+			...
+		}
+		_CheckTimer();//检查定时器事件
+		...
+	}
+}
+//定时器检查
+void CEventDispatch::_CheckTimer()
+{
+	uint64_t curr_tick = get_tick_count();
+	list<TimerItem*>::iterator it;
+	//遍历定时器队列
+	for (it = m_timer_list.begin(); it != m_timer_list.end(); )
+	{
+		TimerItem* pItem = *it;
+		it++;		// iterator maybe deleted in the callback, so we should increment it before callback
+		if (curr_tick >= pItem->next_tick)//定时时间到达
+		{
+			pItem->next_tick += pItem->interval;//更新时间
+			pItem->callback(pItem->user_data, NETLIB_MSG_TIMER, 0, NULL);//执行定时器函数，proxy_timer_callback
+		}
+	}
+}
+//定时器函数
+void proxy_timer_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pParam)
+{
+	uint64_t cur_time = get_tick_count();
+	for (ConnMap_t::iterator it = g_proxy_conn_map.begin(); it != g_proxy_conn_map.end(); ) {//遍历map
+		ConnMap_t::iterator it_old = it;
+		it++;
+		CProxyConn* pConn = (CProxyConn*)it_old->second;//获取CProxyConn
+		pConn->OnTimer(cur_time);//执行对应连接的定时函数
+	}
+}
+/////////
+void CProxyConn::OnTimer(uint64_t curr_tick)
+{
+    //对比上一次服务器发数据的时间，若超过心跳间隔，则主动发送一帧心跳包 , SERVER_HEARTBEAT_INTERVAL=5000
+	if (curr_tick > m_last_send_tick + SERVER_HEARTBEAT_INTERVAL) {// m_last_send_tick 上一次发送数据的时间
+        CImPdu cPdu;
+        IM::Other::IMHeartBeat msg;
+        cPdu.SetPBMsg(&msg);
+        cPdu.SetServiceId(IM::BaseDefine::SID_OTHER);
+        cPdu.SetCommandId(IM::BaseDefine::CID_OTHER_HEARTBEAT);//设置为心跳包
+		SendPdu(&cPdu);//发送心跳包
+	}
+
+    //对比上一次收到数据的时间，如超过指定间隔，则认为客户端已离线，关闭这个连接
+	if (curr_tick > m_last_recv_tick + SERVER_TIMEOUT) {// m_last_recv_tick 上一次收到数据的时间
+		log("proxy connection timeout %s:%d", m_peer_ip.c_str(), m_peer_port);
+		Close();
+	}
+}
+
+///////////////////////////////////////////////////
+// 我挺喜欢这种心跳包的处理方式。
+// 1.服务器定时向客户端发一次心跳包，若有数据包发送，则心跳包推迟下一个时间发送，这样可以充分利用服务器的带宽，而不是使用TCP自带的心跳包的方式，这样会很大占用带宽，但是实际上都是发送一些无意义的数据。
+// 2.服务器在接收客户端数据时，会更新发送时间，若超过一段时间，客户端没有发来数据，则任务客户端已掉线。
+/////////////////////////////////////////////////
+````
+
+
+
+
+
+
 
 
 
