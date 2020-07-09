@@ -1631,6 +1631,1090 @@ void CProxyConn::OnTimer(uint64_t curr_tick)
 
 
 
+#### 2.Msg_server 消息服务器
+
+​		TeamTalk各个服务的功能介绍。TeamTalk是一个分布式部署的聊天服务器，通过分布式部署，可以实现分流以及支持高数量的用户同时在线。MsgServer是整个系统的核心。不同的用户根据各个消息服务器的负载，选择一个服务器连接。RouteServer实现一个MsgServer用户消息转发给其他MsgServer用户，可以拓展。
+
+<img src="TeamTalk框架.png" style="zoom:80%;" />
+
+````c
+LoginServer(C++)	: //负载均衡服务器，会分配一个负载小的MsgServer给客户端使用
+MsgServer(C++)		: //消息服务器，提供客户端的信令功能，提供群聊，私聊等功能。
+RouteServer(C++)	: //路由服务器，提供在不同MsgServer之间消息的转发。
+FileServer(C++)		: //文件服务器，提供客户端之间的文件传输服务，包括离线和在线文件。
+MsfsServer(C++)		: //图片存储服务器，提供图片存储和头像等服务。
+DBProxyServer(C++)	: //数据库代理服务器，提供redis和MySQL等数据库的访问，屏蔽其他服务器和redis与MySQL的访问。
+HttpMsgServer(C++)	: //对外接口，只是一个框架
+PushServer(C++)		: //消息推送服务器，提供IOS系统消息推送(IOS消息推送必须走apns)
+````
+
+
+
+​		MsgServer的连接流程：
+
+````c
+int maint(int argc char*[] argv)
+{
+    //读取配置文件系统
+    //初始化当前服务器
+    //连接其他的服务器：FileServer,DBProxyServer,loginServer,RouteServer,PushServer.
+    //启动事件监听循环
+}
+````
+
+
+
+##### 2.1 配置文件
+
+````c
+CConfigFileReader config_file("msgserver.conf");//读取msgserver.conf
+char* listen_ip = config_file.GetConfigName("ListenIP");// ListenIP=0.0.0.0
+char* str_listen_port = config_file.GetConfigName("ListenPort");//ListenPort=8000
+char* ip_addr1 = config_file.GetConfigName("IpAddr1");	// 电信IP
+char* ip_addr2 = config_file.GetConfigName("IpAddr2");	// 网通IP
+char* str_max_conn_cnt = config_file.GetConfigName("MaxConnCnt");//MaxConnCnt=100000
+char* str_aes_key = config_file.GetConfigName("aesKey");
+uint32_t db_server_count = 0;
+serv_info_t* db_server_list = read_server_config(&config_file, "DBServerIP", "DBServerPort", db_server_count);//DBServerIP1=127.0.0.1,DBServerPort1=10600 ; DBServerIP2=127.0.0.1,BServerPort2=10600
+uint32_t login_server_count = 0;
+serv_info_t* login_server_list = read_server_config(&config_file, "LoginServerIP", "LoginServerPort", login_server_count);
+uint32_t route_server_count = 0;
+serv_info_t* route_server_list = read_server_config(&config_file, "RouteServerIP", "RouteServerPort", route_server_count);
+uint32_t push_server_count = 0;
+serv_info_t* push_server_list = read_server_config(&config_file, "PushServerIP","PushServerPort", push_server_count);
+uint32_t file_server_count = 0;
+serv_info_t* file_server_list = read_server_config(&config_file, "FileServerIP","FileServerPort", file_server_count);
+````
+
+
+
+##### 2.2 MsgServer服务器初始化
+
+````c
+uint16_t listen_port = atoi(str_listen_port);//8000
+uint32_t max_conn_cnt = atoi(str_max_conn_cnt);//100000
+
+int ret = netlib_init();
+
+if (ret == NETLIB_ERROR)
+    return ret;
+
+int main()
+{
+    ...
+    //在8000端口号上侦听客户端连接
+    CStrExplode listen_ip_list(listen_ip, ';');
+    for (uint32_t i = 0; i < listen_ip_list.GetItemCnt(); i++)
+    {
+        ret = netlib_listen(listen_ip_list.GetItem(i), listen_port, msg_serv_callback, NULL);
+        if (ret == NETLIB_ERROR)
+            return ret;
+    }
+    init_msg_conn();//1
+    ...
+}
+
+int netlib_listen(const char*	server_ip, uint16_t	port,callback_t	callback,void*		callback_data)
+{
+	CBaseSocket* pSocket = new CBaseSocket();
+	if (!pSocket)
+		return NETLIB_ERROR;
+	int ret =  pSocket->Listen(server_ip, port, callback, callback_data);
+	if (ret == NETLIB_ERROR)
+		delete pSocket;
+	return ret;
+}
+
+//listen
+int CBaseSocket::Listen(const char* server_ip, uint16_t port, callback_t callback, void* callback_data)
+{
+	m_local_ip = server_ip;
+	m_local_port = port;
+	m_callback = callback;
+	m_callback_data = callback_data;
+	m_socket = socket(AF_INET, SOCK_STREAM, 0);//tcp
+	if (m_socket == INVALID_SOCKET)
+	{
+		printf("socket failed, err_code=%d\n", _GetErrorCode());
+		return NETLIB_ERROR;
+	}
+	_SetReuseAddr(m_socket);//reuse
+	_SetNonblock(m_socket);//non block
+	sockaddr_in serv_addr;
+	_SetAddr(server_ip, port, &serv_addr);
+    int ret = ::bind(m_socket, (sockaddr*)&serv_addr, sizeof(serv_addr));//bind
+	if (ret == SOCKET_ERROR)
+	{
+		log("bind failed, err_code=%d", _GetErrorCode());
+		closesocket(m_socket);
+		return NETLIB_ERROR;
+	}
+	ret = listen(m_socket, 64);//listen
+	if (ret == SOCKET_ERROR)
+	{
+		log("listen failed, err_code=%d", _GetErrorCode());
+		closesocket(m_socket);
+		return NETLIB_ERROR;
+	}
+	m_state = SOCKET_STATE_LISTENING;
+	log("CBaseSocket::Listen on %s:%d", server_ip, port);
+	AddBaseSocket(this);
+	CEventDispatch::Instance()->AddEvent(m_socket, SOCKET_READ | SOCKET_EXCEP);//添加事件监听
+	return NETLIB_OK;
+}
+
+````
+
+````c
+void init_msg_conn()
+{
+	g_last_stat_tick = get_tick_count();
+	signal(SIGUSR1, signal_handler_usr1);
+	signal(SIGUSR2, signal_handler_usr2);
+	signal(SIGHUP, signal_handler_hup);
+	netlib_register_timer(msg_conn_timer_callback, NULL, 1000);//注册定时器，这里是和DBProxyServe一样，是注册定时器来进行心跳包检测和发送
+	s_file_handler = CFileHandler::getInstance();
+	s_group_chat = CGroupChat::GetInstance();
+}
+
+int netlib_register_timer(callback_t callback, void* user_data, uint64_t interval)
+{
+	CEventDispatch::Instance()->AddTimer(callback, user_data, interval);
+	return 0;
+}
+````
+
+
+
+
+
+##### 2.3 连接其他服务器
+
+````c
+init_file_serv_conn(file_server_list, file_server_count);//连接文件服务器
+init_db_serv_conn(db_server_list2, db_server_count2, concurrent_db_conn_cnt);//连接数据库代理服务器
+init_login_serv_conn(login_server_list, login_server_count, ip_addr1, ip_addr2, listen_port, max_conn_cnt);//连接登录服务器
+init_route_serv_conn(route_server_list, route_server_count);//连接路由服务器
+init_push_serv_conn(push_server_list, push_server_count);//连接消息推送服务器
+printf("now enter the event loop...\n");
+````
+
+​		连接流程都一样，以文件服务器为例
+
+````c
+void init_file_serv_conn(serv_info_t* server_list, uint32_t server_count)
+{
+	g_file_server_list = server_list;//g_file_server_list文件服务器队列
+	g_file_server_count = server_count;
+	serv_init<CFileServConn>(g_file_server_list, g_file_server_count);//1.初始化和文件服务器的连接，并将文件服务器连接添加到队列
+	netlib_register_timer(file_server_conn_timer_callback, NULL, 1000);//2.注册定时器
+	s_file_handler = CFileHandler::getInstance();
+}
+//1.
+template <class T>
+void serv_init(serv_info_t* server_list, uint32_t server_count)//连接服务器
+{
+	for (uint32_t i = 0; i < server_count; i++) {
+		T* pConn = new T();//创建一个连接对象
+		pConn->Connect(server_list[i].server_ip.c_str(), server_list[i].server_port, i);
+		server_list[i].serv_conn = pConn;
+		server_list[i].idle_cnt = 0;
+		server_list[i].reconnect_cnt = MIN_RECONNECT_CNT / 2;//MIN_RECONNECT_CNT=4
+	}
+}
+//连接服务器
+void CFileServConn::Connect(const char* server_ip, uint16_t server_port, uint32_t idx)
+{
+	log("Connecting to FileServer %s:%d ", server_ip, server_port);
+	m_serv_idx = idx;
+	m_handle = netlib_connect(server_ip, server_port, imconn_callback, (void*)&g_file_server_conn_map);//连接服务器，并设置回调函数
+	if (m_handle != NETLIB_INVALID_HANDLE) {
+		g_file_server_conn_map.insert(make_pair(m_handle, this));//添加到文件服务器map
+	}
+}
+net_handle_t netlib_connect(const char* server_ip, uint16_t	port, callback_t	callback, void*		callback_data)
+{
+	CBaseSocket* pSocket = new CBaseSocket();
+	if (!pSocket)
+		return NETLIB_INVALID_HANDLE;
+	net_handle_t handle = pSocket->Connect(server_ip, port, callback, callback_data);
+	if (handle == NETLIB_INVALID_HANDLE)
+		delete pSocket;
+	return handle;
+}
+net_handle_t CBaseSocket::Connect(const char* server_ip, uint16_t port, callback_t callback, void* callback_data)
+{
+	log("CBaseSocket::Connect, server_ip=%s, port=%d", server_ip, port);
+
+	m_remote_ip = server_ip;
+	m_remote_port = port;
+	m_callback = callback;//设置回调函数
+	m_callback_data = callback_data;
+	m_socket = socket(AF_INET, SOCK_STREAM, 0);//创建一个client句柄
+	if (m_socket == INVALID_SOCKET)
+	{
+		log("socket failed, err_code=%d", _GetErrorCode());
+		return NETLIB_INVALID_HANDLE;
+	}
+	_SetNonblock(m_socket);//非阻塞
+	_SetNoDelay(m_socket);//禁用Nagle算法
+	sockaddr_in serv_addr;
+	_SetAddr(server_ip, port, &serv_addr);
+	int ret = connect(m_socket, (sockaddr*)&serv_addr, sizeof(serv_addr));//连接服务器
+	if ( (ret == SOCKET_ERROR) && (!_IsBlock(_GetErrorCode())) )
+	{	
+		log("connect failed, err_code=%d", _GetErrorCode());
+		closesocket(m_socket);
+		return NETLIB_INVALID_HANDLE;
+	}
+	m_state = SOCKET_STATE_CONNECTING;
+	AddBaseSocket(this);
+	CEventDispatch::Instance()->AddEvent(m_socket, SOCKET_ALL);//监听所有事件
+	return (net_handle_t)m_socket;
+}
+
+//在事件监听中立即出发可写（服务器没那么快发来数据，因此可读还无法触发）
+void CEventDispatch::StartDispatch(uint32_t wait_timeout)
+{	
+    if (events[i].events & EPOLLOUT)
+    {
+        //log("OnWrite, socket=%d\n", ev_fd);
+        pSocket->OnWrite();
+    }
+}
+//执行可写
+void CBaseSocket::OnWrite()
+{
+#if ((defined _WIN32) || (defined __APPLE__))
+	CEventDispatch::Instance()->RemoveEvent(m_socket, SOCKET_WRITE);
+#endif
+
+	if (m_state == SOCKET_STATE_CONNECTING)
+	{
+		int error = 0;
+		socklen_t len = sizeof(error);
+#ifdef _WIN32
+		getsockopt(m_socket, SOL_SOCKET, SO_ERROR, (char*)&error, &len);
+#else
+		getsockopt(m_socket, SOL_SOCKET, SO_ERROR, (void*)&error, &len);
+#endif
+		if (error) {
+			m_callback(m_callback_data, NETLIB_MSG_CLOSE, (net_handle_t)m_socket, NULL);
+		} else {
+			m_state = SOCKET_STATE_CONNECTED;//修改为已连接状态
+			m_callback(m_callback_data, NETLIB_MSG_CONFIRM, (net_handle_t)m_socket, NULL);//执行回调函数
+		}
+	}
+	else
+	{
+		m_callback(m_callback_data, NETLIB_MSG_WRITE, (net_handle_t)m_socket, NULL);
+	}
+}
+
+//回调函数
+void imconn_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pParam)//设置回调函数
+{
+    ...
+	ConnMap_t* conn_map = (ConnMap_t*)callback_data;
+	CImConn* pConn = FindImConn(conn_map, handle);
+	...
+	switch (msg)
+	{
+	case NETLIB_MSG_CONFIRM://NETLIB_MSG_CONFIRM
+		pConn->OnConfirm();
+		break;
+	...
+}
+
+//发布连接确认信息
+void CFileServConn::OnConfirm()
+{
+	log("connect to file server success ");
+	m_bOpen = true;
+	m_connect_time = get_tick_count();
+	g_file_server_list[m_serv_idx].reconnect_cnt = MIN_RECONNECT_CNT / 2;
+    
+    //连上file_server以后，给file_server发送获取ip地址的数据包
+    IM::Server::IMFileServerIPReq msg;
+    CImPdu pdu;
+    pdu.SetPBMsg(&msg);
+    pdu.SetServiceId(SID_OTHER);
+    pdu.SetCommandId(CID_OTHER_FILE_SERVER_IP_REQ);
+    SendPdu(&pdu);
+}
+    
+///////////////////////////////////////////////////////////
+// 上面的这些步骤，实现的功能是在连接FileServer之后，发起获取文件服务器信息的请求。
+
+//2.注册定时器
+int netlib_register_timer(callback_t callback, void* user_data, uint64_t interval)
+{
+	CEventDispatch::Instance()->AddTimer(callback, user_data, interval);
+	return 0;
+}
+//文件服务器定时器回调函数
+void file_server_conn_timer_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pParam)
+{
+	ConnMap_t::iterator it_old;
+	CFileServConn* pConn = NULL;
+	uint64_t cur_time = get_tick_count();
+	for (ConnMap_t::iterator it = g_file_server_conn_map.begin(); it != g_file_server_conn_map.end();)
+    {
+        it_old = it;
+        it++;
+		pConn = (CFileServConn*)it_old->second;
+		pConn->OnTimer(cur_time);//发送心跳包，若超过一定时间没有回复，则会将连接关闭，并踢出g_file_server_conn_map
+	}
+	// reconnect FileServer
+	serv_check_reconnect<CFileServConn>(g_file_server_list, g_file_server_count);
+}
+
+//检测是否挂了。若挂了，重新连接
+template <class T>
+void serv_check_reconnect(serv_info_t* server_list, uint32_t server_count)
+{
+	T* pConn;
+	for (uint32_t i = 0; i < server_count; i++) {
+		pConn = (T*)server_list[i].serv_conn;
+		if (!pConn) {
+			server_list[i].idle_cnt++;
+			if (server_list[i].idle_cnt >= server_list[i].reconnect_cnt) {
+				pConn = new T();
+				pConn->Connect(server_list[i].server_ip.c_str(), server_list[i].server_port, i);
+				server_list[i].serv_conn = pConn;
+			}
+		}
+	}
+}
+
+````
+
+​		关于LoginServer的一些特殊情况
+
+````c
+// 连接LoginServer之后，会告诉服务器当前MsgServer的ip地址，端口，已登录的用户数量，最大容纳的用户数量。
+void CLoginServConn::OnConfirm()
+{
+	log("connect to login server success ");
+	m_bOpen = true;
+	g_login_server_list[m_serv_idx].reconnect_cnt = MIN_RECONNECT_CNT / 2;
+
+	uint32_t cur_conn_cnt = 0;
+	uint32_t shop_user_cnt = 0;
+    
+    //连接login_server成功以后,告诉login_server自己的ip地址、端口号
+    //和当前登录的用户数量和可容纳的最大用户数量
+    list<user_conn_t> user_conn_list;
+    CImUserManager::GetInstance()->GetUserConnCnt(&user_conn_list, cur_conn_cnt);
+	char hostname[256] = {0};
+	gethostname(hostname, 256);
+    IM::Server::IMMsgServInfo msg;
+    msg.set_ip1(g_msg_server_ip_addr1);
+    msg.set_ip2(g_msg_server_ip_addr2);
+    msg.set_port(g_msg_server_port);
+    msg.set_max_conn_cnt(g_max_conn_cnt);
+    msg.set_cur_conn_cnt(cur_conn_cnt);
+    msg.set_host_name(hostname);
+    CImPdu pdu;
+    pdu.SetPBMsg(&msg);
+    pdu.SetServiceId(SID_OTHER);
+    pdu.SetCommandId(CID_OTHER_MSG_SERV_INFO);
+	SendPdu(&pdu);
+}
+````
+
+
+
+##### 2.4  IO事件循环
+
+````c
+// IO事件的循环和DBProxyServer类似，下面是FileServe对于消息协议包的处理。
+void CFileServConn::HandlePdu(CImPdu* pPdu)
+{
+	switch (pPdu->GetCommandId()) {
+        case CID_OTHER_HEARTBEAT:
+            break;
+        case CID_OTHER_FILE_TRANSFER_RSP:
+            _HandleFileMsgTransRsp(pPdu);
+            break;
+        case CID_OTHER_FILE_SERVER_IP_RSP:
+            _HandleFileServerIPRsp(pPdu);
+            break;
+        default:
+            log("unknown cmd id=%d ", pPdu->GetCommandId());
+            break;
+	}
+}
+````
+
+
+
+
+
+#### 3.LoginServer 登录分流服务器
+
+​		登录服务器最准确的名称应该是登录分流服务器，它连接所有的消息服务器，在接收客户端的连接请求之后，选择负载最小的消息服务器MsgServer给客户端。
+
+````c
+int main()
+{
+    //读取配置文件
+    //在8008端口监听客户端的连接
+    //在8100端口监听MsgServer的连接
+    //在8080端口监听客户端http连接
+    //初始化login connection
+    //初始化http connection
+    //进行事件循环
+}
+````
+
+##### 3.1 配置文件
+
+````c
+	CConfigFileReader config_file("loginserver.conf");//读取loginserver.conf
+    char* client_listen_ip = config_file.GetConfigName("ClientListenIP");//0.0.0.0
+    char* str_client_port = config_file.GetConfigName("ClientPort");//8008
+    char* http_listen_ip = config_file.GetConfigName("HttpListenIP");//0.0.0.0
+    char* str_http_port = config_file.GetConfigName("HttpPort");//8080
+	char* msg_server_listen_ip = config_file.GetConfigName("MsgServerListenIP");//0.0.0.0
+	char* str_msg_server_port = config_file.GetConfigName("MsgServerPort");//8100
+    char* str_msfs_url = config_file.GetConfigName("msfs");
+    char* str_discovery = config_file.GetConfigName("discovery");
+	if (!msg_server_listen_ip || !str_msg_server_port || !http_listen_ip
+        || !str_http_port || !str_msfs_url || !str_discovery) {
+		log("config item missing, exit... ");
+		return -1;
+	}
+	uint16_t client_port = atoi(str_client_port);
+	uint16_t msg_server_port = atoi(str_msg_server_port);
+    uint16_t http_port = atoi(str_http_port);
+````
+
+##### 3.2 监听客户端连接 && msg_server的连接
+
+````c++
+//在8080端口监听客户端连接
+char* str_client_port = config_file.GetConfigName("ClientPort");//8008
+uint16_t client_port = atoi(str_client_port);
+CStrExplode client_listen_ip_list(client_listen_ip, ';');
+for (uint32_t i = 0; i < client_listen_ip_list.GetItemCnt(); i++)
+{
+    ret = netlib_listen(client_listen_ip_list.GetItem(i), client_port, client_callback, NULL);
+    if (ret == NETLIB_ERROR)
+        return ret;
+}
+int netlib_listen(const char* server_ip, uint16_t port,callback_t callback,void* callback_data)
+{
+	CBaseSocket* pSocket = new CBaseSocket();
+	if (!pSocket)
+		return NETLIB_ERROR;
+	int ret =  pSocket->Listen(server_ip, port, callback, callback_data);
+	if (ret == NETLIB_ERROR)
+		delete pSocket;
+	return ret;
+}
+
+//这个函数已经分析过很多次了
+int CBaseSocket::Listen(const char* server_ip, uint16_t port, callback_t callback, void* callback_data)
+{
+	m_local_ip = server_ip;
+	m_local_port = port;
+	m_callback = callback;
+	m_callback_data = callback_data;
+	m_socket = socket(AF_INET, SOCK_STREAM, 0);
+	if (m_socket == INVALID_SOCKET)
+	{
+		printf("socket failed, err_code=%d\n", _GetErrorCode());
+		return NETLIB_ERROR;
+	}
+	_SetReuseAddr(m_socket);
+	_SetNonblock(m_socket);
+	sockaddr_in serv_addr;
+	_SetAddr(server_ip, port, &serv_addr);
+    int ret = ::bind(m_socket, (sockaddr*)&serv_addr, sizeof(serv_addr));
+	if (ret == SOCKET_ERROR)
+	{
+		log("bind failed, err_code=%d", _GetErrorCode());
+		closesocket(m_socket);
+		return NETLIB_ERROR;
+	}
+	ret = listen(m_socket, 64);
+	if (ret == SOCKET_ERROR)
+	{
+		log("listen failed, err_code=%d", _GetErrorCode());
+		closesocket(m_socket);
+		return NETLIB_ERROR;
+	}
+	m_state = SOCKET_STATE_LISTENING;
+	log("CBaseSocket::Listen on %s:%d", server_ip, port);
+	AddBaseSocket(this);
+	CEventDispatch::Instance()->AddEvent(m_socket, SOCKET_READ | SOCKET_EXCEP);//监听可读事件
+	return NETLIB_OK;
+}
+
+//客户端会发送数据，socket产生可读事件，会执行回调函数
+void client_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pParam)
+{
+	if (msg == NETLIB_MSG_CONNECT)
+	{
+		CLoginConn* pConn = new CLoginConn();//创建登录连接
+		pConn->OnConnect2(handle, LOGIN_CONN_TYPE_CLIENT);
+	}
+	else
+	{
+		log("!!!error msg: %d ", msg);
+	}
+}
+//OnConnect2
+void CLoginConn::OnConnect2(net_handle_t handle, int conn_type)
+{
+	m_handle = handle;
+	m_conn_type = conn_type;
+	ConnMap_t* conn_map = &g_msg_serv_conn_map;
+	if (conn_type == LOGIN_CONN_TYPE_CLIENT) {//客户端登录，这是map为g_client_conn_map
+		conn_map = &g_client_conn_map;
+	}else
+		conn_map->insert(make_pair(handle, this));
+
+	netlib_option(handle, NETLIB_OPT_SET_CALLBACK, (void*)imconn_callback);//设置客户端服务器连接的回调函数
+	netlib_option(handle, NETLIB_OPT_SET_CALLBACK_DATA, (void*)conn_map);
+}
+
+//实际上执行的回调函数，之前Accept又注册了可读事件监听，会触发NETLIB_MSG_READ，由于CImConn的子类对于Read都没有覆盖，因此对协议包读取的方式是一样的，但是他们对于包的处理是有覆盖的。
+void imconn_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pParam)
+{
+    ...
+	ConnMap_t* conn_map = (ConnMap_t*)callback_data;
+	CImConn* pConn = FindImConn(conn_map, handle);
+	switch (msg)
+	{
+	case NETLIB_MSG_CONFIRM:
+		pConn->OnConfirm();
+		break;
+	case NETLIB_MSG_READ:
+		pConn->OnRead();
+		break;
+	case NETLIB_MSG_WRITE:
+		pConn->OnWrite();
+		break;
+	case NETLIB_MSG_CLOSE:
+		pConn->OnClose();
+		break;
+	default:
+		log("!!!imconn_callback error msg: %d ", msg);
+		break;
+	}
+	pConn->ReleaseRef();
+}
+//处理协议包
+void CLoginConn::HandlePdu(CImPdu* pPdu)
+{
+	switch (pPdu->GetCommandId()) {
+        case CID_OTHER_HEARTBEAT://心跳命令
+            break;
+        case CID_OTHER_MSG_SERV_INFO:
+            _HandleMsgServInfo(pPdu);//处理服务器信息
+            break;
+        case CID_OTHER_USER_CNT_UPDATE:
+            _HandleUserCntUpdate(pPdu);//用户上下线数据更新
+            break;
+        case CID_LOGIN_REQ_MSGSERVER:
+            _HandleMsgServRequest(pPdu);//回复客户端服务器信息
+            break;
+        default:
+            log("wrong msg, cmd id=%d ", pPdu->GetCommandId());
+            break;
+	}
+}
+
+//处理服务器信息
+void CLoginConn::_HandleMsgServInfo(CImPdu* pPdu)
+{
+	msg_serv_info_t* pMsgServInfo = new msg_serv_info_t;
+    IM::Server::IMMsgServInfo msg;//服务器信息
+    msg.ParseFromArray(pPdu->GetBodyData(), pPdu->GetBodyLength());
+    
+	pMsgServInfo->ip_addr1 = msg.ip1();//记录服务器信息
+	pMsgServInfo->ip_addr2 = msg.ip2();
+	pMsgServInfo->port = msg.port();
+	pMsgServInfo->max_conn_cnt = msg.max_conn_cnt();
+	pMsgServInfo->cur_conn_cnt = msg.cur_conn_cnt();
+	pMsgServInfo->hostname = msg.host_name();
+	g_msg_serv_info.insert(make_pair(m_handle, pMsgServInfo));//记录在g_msg_serv_info
+	g_total_online_user_cnt += pMsgServInfo->cur_conn_cnt;
+	log("MsgServInfo, ip_addr1=%s, ip_addr2=%s, port=%d, max_conn_cnt=%d, cur_conn_cnt=%d, hostname: %s. ",
+		pMsgServInfo->ip_addr1.c_str(), pMsgServInfo->ip_addr2.c_str(), pMsgServInfo->port,pMsgServInfo->max_conn_cnt,
+		pMsgServInfo->cur_conn_cnt, pMsgServInfo->hostname.c_str());
+}
+map<uint32_t, msg_serv_info_t*> g_msg_serv_info;
+typedef struct  {
+    string		ip_addr1;	// 电信IP
+    string		ip_addr2;	// 网通IP
+    uint16_t	port;
+    uint32_t	max_conn_cnt;
+    uint32_t	cur_conn_cnt;
+    string 		hostname;	// 消息服务器的主机名
+} msg_serv_info_t;
+
+//用户上下线信息更新
+void CLoginConn::_HandleUserCntUpdate(CImPdu* pPdu)
+{
+	map<uint32_t, msg_serv_info_t*>::iterator it = g_msg_serv_info.find(m_handle);
+	if (it != g_msg_serv_info.end()) {
+		msg_serv_info_t* pMsgServInfo = it->second;
+        IM::Server::IMUserCntUpdate msg;
+        msg.ParseFromArray(pPdu->GetBodyData(), pPdu->GetBodyLength());
+		uint32_t action = msg.user_action();
+		if (action == USER_CNT_INC) {//上限
+			pMsgServInfo->cur_conn_cnt++;
+			g_total_online_user_cnt++;
+		} else {//下线
+			pMsgServInfo->cur_conn_cnt--;
+			g_total_online_user_cnt--;
+		}
+		log("%s:%d, cur_cnt=%u, total_cnt=%u ", pMsgServInfo->hostname.c_str(),
+            pMsgServInfo->port, pMsgServInfo->cur_conn_cnt, g_total_online_user_cnt);
+	}
+}
+
+//回复客户端关于msg_server的信息
+void CLoginConn::_HandleMsgServRequest(CImPdu* pPdu)
+{
+    IM::Login::IMMsgServReq msg;
+    msg.ParseFromArray(pPdu->GetBodyData(), pPdu->GetBodyLength());
+	log("HandleMsgServReq. ");
+	// no MessageServer available
+	if (g_msg_serv_info.size() == 0) {//暂时没有msg_server服务器连接上
+        IM::Login::IMMsgServRsp msg;
+        msg.set_result_code(::IM::BaseDefine::REFUSE_REASON_NO_MSG_SERVER);
+        CImPdu pdu;
+        pdu.SetPBMsg(&msg);
+        pdu.SetServiceId(SID_LOGIN);
+        pdu.SetCommandId(CID_LOGIN_RES_MSGSERVER);
+        pdu.SetSeqNum(pPdu->GetSeqNum());
+        SendPdu(&pdu);
+        Close();
+		return;
+	}
+	// return a message server with minimum concurrent connection count
+	msg_serv_info_t* pMsgServInfo;
+	uint32_t min_user_cnt = (uint32_t)-1;
+	map<uint32_t, msg_serv_info_t*>::iterator it_min_conn = g_msg_serv_info.end(),it;
+	//分流
+	for (it = g_msg_serv_info.begin() ; it != g_msg_serv_info.end(); it++) {
+		pMsgServInfo = it->second;
+		if ( (pMsgServInfo->cur_conn_cnt < pMsgServInfo->max_conn_cnt) &&
+			 (pMsgServInfo->cur_conn_cnt < min_user_cnt))
+        {
+			it_min_conn = it;
+			min_user_cnt = pMsgServInfo->cur_conn_cnt;
+		}
+	}
+    //全部服务器都已经满载
+	if (it_min_conn == g_msg_serv_info.end()) {
+		log("All TCP MsgServer are full ");
+        IM::Login::IMMsgServRsp msg;
+        msg.set_result_code(::IM::BaseDefine::REFUSE_REASON_MSG_SERVER_FULL);
+        CImPdu pdu;
+        pdu.SetPBMsg(&msg);
+        pdu.SetServiceId(SID_LOGIN);
+        pdu.SetCommandId(CID_LOGIN_RES_MSGSERVER);
+        pdu.SetSeqNum(pPdu->GetSeqNum());
+        SendPdu(&pdu);
+	}
+    else
+    {//负载找到负载低的服务器，返回服务器连接。
+        IM::Login::IMMsgServRsp msg;
+        msg.set_result_code(::IM::BaseDefine::REFUSE_REASON_NONE);
+        msg.set_prior_ip(it_min_conn->second->ip_addr1);
+        msg.set_backip_ip(it_min_conn->second->ip_addr2);
+        msg.set_port(it_min_conn->second->port);
+        CImPdu pdu;
+        pdu.SetPBMsg(&msg);
+        pdu.SetServiceId(SID_LOGIN);
+        pdu.SetCommandId(CID_LOGIN_RES_MSGSERVER);
+        pdu.SetSeqNum(pPdu->GetSeqNum());
+        SendPdu(&pdu);
+    }
+    //找到负载低的服务器，关闭当前连接
+	Close();	// after send MsgServResponse, active close the connection
+}
+````
+
+ 		msgserver和上面的类似
+
+````c
+//在8100上监听msg_server的连接
+CStrExplode msg_server_listen_ip_list(msg_server_listen_ip, ';');
+uint16_t msg_server_port = atoi(str_msg_server_port);
+for (uint32_t i = 0; i < msg_server_listen_ip_list.GetItemCnt(); i++)
+{
+    ret = netlib_listen(msg_server_listen_ip_list.GetItem(i), msg_server_port, msg_serv_callback, NULL);//
+    if (ret == NETLIB_ERROR)
+        return ret;
+}
+// this callback will be replaced by imconn_callback() in OnConnect()
+void msg_serv_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pParam)
+{
+    log("msg_server come in");
+	if (msg == NETLIB_MSG_CONNECT)
+	{
+		CLoginConn* pConn = new CLoginConn();
+		pConn->OnConnect2(handle, LOGIN_CONN_TYPE_MSG_SERV);
+	}
+	else
+	{
+		log("!!!error msg: %d ", msg);
+	}
+}
+````
+
+##### 3.3 监听http连接
+
+````c++
+//在8080上监听客户端http连接
+char* str_http_port = config_file.GetConfigName("HttpPort");
+uint16_t http_port = atoi(str_http_port);
+CStrExplode http_listen_ip_list(http_listen_ip, ';');
+for (uint32_t i = 0; i < http_listen_ip_list.GetItemCnt(); i++)
+{
+    ret = netlib_listen(http_listen_ip_list.GetItem(i), http_port, http_callback, NULL);
+    if (ret == NETLIB_ERROR)
+        return ret;
+}
+//连接上回调函数后
+void http_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pParam)
+{
+    if (msg == NETLIB_MSG_CONNECT)
+    {
+        CHttpConn* pConn = new CHttpConn();
+        pConn->OnConnect(handle);
+    }
+    else
+    {
+        log("!!!error msg: %d ", msg);
+    }
+}
+
+void CHttpConn::OnConnect(net_handle_t handle)
+{
+    printf("OnConnect, handle=%d\n", handle);
+    m_sock_handle = handle;
+    m_state = CONN_STATE_CONNECTED;
+    g_http_conn_map.insert(make_pair(m_conn_handle, this));
+    
+    netlib_option(handle, NETLIB_OPT_SET_CALLBACK, (void*)httpconn_callback);
+    netlib_option(handle, NETLIB_OPT_SET_CALLBACK_DATA, reinterpret_cast<void *>(m_conn_handle) );
+    netlib_option(handle, NETLIB_OPT_GET_REMOTE_IP, (void*)&m_peer_ip);
+}
+
+void httpconn_callback(void* callback_data, uint8_t msg, uint32_t handle, uint32_t uParam, void* pParam)
+{
+	NOTUSED_ARG(uParam);
+	NOTUSED_ARG(pParam);
+	// convert void* to uint32_t, oops
+	uint32_t conn_handle = *((uint32_t*)(&callback_data));
+    CHttpConn* pConn = FindHttpConnByHandle(conn_handle);
+    if (!pConn) {
+        return;
+    }
+	switch (msg)
+	{
+	case NETLIB_MSG_READ:
+		pConn->OnRead();
+		break;
+	case NETLIB_MSG_WRITE:
+		pConn->OnWrite();
+		break;
+	case NETLIB_MSG_CLOSE:
+		pConn->OnClose();
+		break;
+	default:
+		log("!!!httpconn_callback error msg: %d ", msg);
+		break;
+	}
+}
+
+//触发读事件
+void CHttpConn::OnRead()
+{
+	for (;;)
+	{
+		uint32_t free_buf_len = m_in_buf.GetAllocSize() - m_in_buf.GetWriteOffset();
+		if (free_buf_len < READ_BUF_SIZE + 1)
+			m_in_buf.Extend(READ_BUF_SIZE + 1);
+		int ret = netlib_recv(m_sock_handle, m_in_buf.GetBuffer() + m_in_buf.GetWriteOffset(), READ_BUF_SIZE);
+		if (ret <= 0)
+			break;
+		m_in_buf.IncWriteOffset(ret);
+		m_last_recv_tick = get_tick_count();
+	}
+	// 每次请求对应一个HTTP连接，所以读完数据后，不用在同一个连接里面准备读取下个请求
+	char* in_buf = (char*)m_in_buf.GetBuffer();
+	uint32_t buf_len = m_in_buf.GetWriteOffset();
+	in_buf[buf_len] = '\0';
+    // 如果buf_len 过长可能是受到攻击，则断开连接
+    // 正常的url最大长度为2048，我们接受的所有数据长度不得大于1K
+    if(buf_len > 1024)
+    {
+        log("get too much data:%s ", in_buf);
+        Close();
+        return;
+    }
+	//log("OnRead, buf_len=%u, conn_handle=%u\n", buf_len, m_conn_handle); // for debug
+	m_cHttpParser.ParseHttpContent(in_buf, buf_len);
+
+	if (m_cHttpParser.IsReadAll()) {//http://192.168.226.128:8080/msg_server，请求msgserver
+		string url =  m_cHttpParser.GetUrl();
+		if (strncmp(url.c_str(), "/msg_server", 11) == 0) {
+            string content = m_cHttpParser.GetBodyContent();
+            _HandleMsgServRequest(url, content);//处理请求
+		} else {
+			log("url unknown, url=%s ", url.c_str());
+			Close();
+		}
+	}
+}
+
+// Add By Lanhu 2014-12-19 通过登陆IP来优选电信还是联通IP
+void CHttpConn::_HandleMsgServRequest(string& url, string& post_data)
+{
+    msg_serv_info_t* pMsgServInfo;
+    uint32_t min_user_cnt = (uint32_t)-1;
+    map<uint32_t, msg_serv_info_t*>::iterator it_min_conn = g_msg_serv_info.end();
+    map<uint32_t, msg_serv_info_t*>::iterator it;
+    if(g_msg_serv_info.size() <= 0)
+    {
+        Json::Value value;
+        value["code"] = 1;
+        value["msg"] = "没有msg_server";
+        string strContent = value.toStyledString();
+        char* szContent = new char[HTTP_RESPONSE_HTML_MAX];
+        snprintf(szContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, strContent.length(), strContent.c_str());
+        Send((void*)szContent, strlen(szContent));
+        delete [] szContent;
+        return ;
+    }
+    
+    for (it = g_msg_serv_info.begin() ; it != g_msg_serv_info.end(); it++) {
+        pMsgServInfo = it->second;
+        if ( (pMsgServInfo->cur_conn_cnt < pMsgServInfo->max_conn_cnt) &&
+            (pMsgServInfo->cur_conn_cnt < min_user_cnt)) {
+            it_min_conn = it;
+            min_user_cnt = pMsgServInfo->cur_conn_cnt;
+        }
+    }
+    
+    if (it_min_conn == g_msg_serv_info.end()) {
+        log("All TCP MsgServer are full ");
+        Json::Value value;
+        value["code"] = 2;
+        value["msg"] = "负载过高";
+        string strContent = value.toStyledString();
+        char* szContent = new char[HTTP_RESPONSE_HTML_MAX];
+        snprintf(szContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, strContent.length(), strContent.c_str());
+        Send((void*)szContent, strlen(szContent));
+        delete [] szContent;
+        return;
+    } else {
+        Json::Value value;
+        value["code"] = 0;
+        value["msg"] = "";
+        if(pIpParser->isTelcome(GetPeerIP()))
+        {
+            value["priorIP"] = string(it_min_conn->second->ip_addr1);
+            value["backupIP"] = string(it_min_conn->second->ip_addr2);
+            value["msfsPrior"] = strMsfsUrl;
+            value["msfsBackup"] = strMsfsUrl;
+        }
+        else
+        {
+            value["priorIP"] = string(it_min_conn->second->ip_addr2);
+            value["backupIP"] = string(it_min_conn->second->ip_addr1);
+            value["msfsPrior"] = strMsfsUrl;
+            value["msfsBackup"] = strMsfsUrl;
+        }
+        value["discovery"] = strDiscovery;
+        value["port"] = int2string(it_min_conn->second->port);
+        string strContent = value.toStyledString();
+        char* szContent = new char[HTTP_RESPONSE_HTML_MAX];
+        uint32_t nLen = strContent.length();
+        snprintf(szContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, nLen, strContent.c_str());
+        Send((void*)szContent, strlen(szContent));//发送响应
+        delete [] szContent;
+        return;
+    }
+}
+````
+
+##### 3.5 初始化login connection && httpconnection
+
+````c++
+init_login_conn();//从后面的分析来看，它的作用是向客户端和msgserver发送心跳包
+void init_login_conn()
+{
+	netlib_register_timer(login_conn_timer_callback, NULL, 1000);
+}
+int netlib_register_timer(callback_t callback, void* user_data, uint64_t interval)
+{
+	CEventDispatch::Instance()->AddTimer(callback, user_data, interval);
+	return 0;
+}
+//login connection定时向每一个连接的客户端发送心跳包，向每一个连接的msg_server发送心跳包
+void CEventDispatch::AddTimer(callback_t callback, void* user_data, uint64_t interval)
+{
+	list<TimerItem*>::iterator it;
+	for (it = m_timer_list.begin(); it != m_timer_list.end(); it++)
+	{
+		TimerItem* pItem = *it;
+		if (pItem->callback == callback && pItem->user_data == user_data)
+		{
+			pItem->interval = interval;
+			pItem->next_tick = get_tick_count() + interval;
+			return;
+		}
+	}
+	TimerItem* pItem = new TimerItem;
+	pItem->callback = callback;
+	pItem->user_data = user_data;
+	pItem->interval = interval;
+	pItem->next_tick = get_tick_count() + interval;
+	m_timer_list.push_back(pItem);
+}
+
+//定时器执行函数
+void login_conn_timer_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pParam)
+{
+	uint64_t cur_time = get_tick_count();
+	for (ConnMap_t::iterator it = g_client_conn_map.begin(); it != g_client_conn_map.end(); ) {
+		ConnMap_t::iterator it_old = it;
+		it++;
+
+		CLoginConn* pConn = (CLoginConn*)it_old->second;
+		pConn->OnTimer(cur_time);//执行每一个connection的定时函数
+	}
+
+	for (ConnMap_t::iterator it = g_msg_serv_conn_map.begin(); it != g_msg_serv_conn_map.end(); ) {
+		ConnMap_t::iterator it_old = it;
+		it++;
+
+		CLoginConn* pConn = (CLoginConn*)it_old->second;
+		pConn->OnTimer(cur_time);
+	}
+}
+
+//发送心跳包
+void CLoginConn::OnTimer(uint64_t curr_tick)
+{
+	if (m_conn_type == LOGIN_CONN_TYPE_CLIENT) {
+		if (curr_tick > m_last_recv_tick + CLIENT_TIMEOUT) {
+			Close();
+		}
+	} else {
+		if (curr_tick > m_last_send_tick + SERVER_HEARTBEAT_INTERVAL) {
+            IM::Other::IMHeartBeat msg;
+            CImPdu pdu;
+            pdu.SetPBMsg(&msg);
+            pdu.SetServiceId(SID_OTHER);
+            pdu.SetCommandId(CID_OTHER_HEARTBEAT);
+			SendPdu(&pdu);
+		}
+		if (curr_tick > m_last_recv_tick + SERVER_TIMEOUT) {
+			log("connection to MsgServer timeout ");
+			Close();
+		}
+	}
+}
+````
+
+````c++
+init_http_conn();
+void init_http_conn()
+{
+	netlib_register_timer(http_conn_timer_callback, NULL, 1000);
+}
+//http连接定时函数，遍历每一个http连接，超时自动关闭连接，不会发送心跳包，这个符合http的连接的性质。
+void http_conn_timer_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pParam)
+{
+	CHttpConn* pConn = NULL;
+	HttpConnMap_t::iterator it, it_old;
+	uint64_t cur_time = get_tick_count();
+	for (it = g_http_conn_map.begin(); it != g_http_conn_map.end(); ) {
+		it_old = it;
+		it++;
+		pConn = it_old->second;
+		pConn->OnTimer(cur_time);
+	}
+}
+
+void CHttpConn::OnTimer(uint64_t curr_tick)
+{
+	if (curr_tick > m_last_recv_tick + HTTP_CONN_TIMEOUT) {
+		log("HttpConn timeout, handle=%d ", m_conn_handle);
+		Close();
+	}
+}
+````
+
+##### 3.6 事件分发
+
+````c++
+//和之前分析的是一样的
+netlib_eventloop();
+void netlib_eventloop(uint32_t wait_timeout)
+{
+	CEventDispatch::Instance()->StartDispatch(wait_timeout);
+}
+void CEventDispatch::StartDispatch(uint32_t wait_timeout)
+{
+    ...
+	while (running)
+	{
+		nfds = epoll_wait(m_epfd, events, 1024, wait_timeout);
+		for (int i = 0; i < nfds; i++)
+		{
+			int ev_fd = events[i].data.fd;
+			CBaseSocket* pSocket = FindBaseSocket(ev_fd);
+			...
+			if (events[i].events & EPOLLIN)
+			{
+				//log("OnRead, socket=%d\n", ev_fd);
+				pSocket->OnRead();
+			}
+			if (events[i].events & EPOLLOUT)
+			{
+				//log("OnWrite, socket=%d\n", ev_fd);
+				pSocket->OnWrite();
+			}
+			...
+			pSocket->ReleaseRef();
+		}
+		_CheckTimer();//定时器事件
+        _CheckLoop();//响应事件
+	}
+}
+````
+
+
+
+#### 4.msfs服务器 聊天图片的上传和下载服务器。
+
+​		msfs服务器是单独的服务器，被客户端直接访问，不与其他服务器连接。
+
+​		客户端以http的方式上传和下载聊天图片。
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
