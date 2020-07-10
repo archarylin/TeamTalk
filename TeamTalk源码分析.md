@@ -2703,6 +2703,1211 @@ void CEventDispatch::StartDispatch(uint32_t wait_timeout)
 
 ​		客户端以http的方式上传和下载聊天图片。
 
+​		http请求协议如下：
+
+````c++
+GET /index.php http/1.1\r\n
+Host: www.hootina.org\r\n
+Connection: keep_alive\r\n
+Cache-Control: max-age=0\r\n
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\n
+User-Agent: Mozilla/5.0\r\n
+\r\n
+````
+
+​		由上面的一个例子，可以知道大概的格式：
+
+````c++
+请求方法 请求资源路径 协议版本\r\n
+字段1: 值1\r\n
+字段2: 值2\r\n
+\r\n
+[get方法请求资源的在这里]
+````
+
+​		请求资源路径一栏可能存在字符长度限制，因此，对于字符长度超过限制的情况，可以使用Get方法，将请求资源放在这个位置。
+
+````c
+msfsServer的处理流程
+int main()
+{
+    //读取配置文件
+    //初始化线程池Post/Get
+    //初始化fileManager文件目录
+    //监听8700端口
+    //消息循环
+}
+````
+
+##### 4.1配置文件
+
+​	读取配置文件
+
+````c
+CConfigFileReader config_file("msfs.conf");//读取配置文件
+char* listen_ip = config_file.GetConfigName("ListenIP");//ListenIP=127.0.0.1
+char* str_listen_port = config_file.GetConfigName("ListenPort");//ListenPort=8700
+char* base_dir = config_file.GetConfigName("BaseDir");//BaseDir=
+char* str_file_cnt = config_file.GetConfigName("FileCnt");//FileCnt=0
+char* str_files_per_dir = config_file.GetConfigName("FilesPerDir");//FilesPerDir=30000
+char* str_post_thread_count = config_file.GetConfigName("PostThreadCount");//GetThreadCount=32
+char* str_get_thread_count = config_file.GetConfigName("GetThreadCount");//PostThreadCount=1
+if (!listen_ip || !str_listen_port || !base_dir || !str_file_cnt || !str_files_per_dir || !str_post_thread_count || !str_get_thread_count)
+{
+    log("config file miss, exit...");
+    return -1;
+}
+log("%s,%s",listen_ip, str_listen_port);
+uint16_t listen_port = atoi(str_listen_port);
+long long int  fileCnt = atoll(str_file_cnt);
+int filesPerDir = atoi(str_files_per_dir);
+int nPostThreadCount = atoi(str_post_thread_count);
+int nGetThreadCount = atoi(str_get_thread_count);
+````
+
+##### 4.2 启动Post/Get线程池队列
+
+````c++
+g_PostThreadPool.Init(nPostThreadCount);
+g_GetThreadPool.Init(nGetThreadCount);
+
+int CThreadPool::Init(uint32_t worker_size)
+{
+    m_worker_size = worker_size;
+	m_worker_list = new CWorkerThread [m_worker_size];//线程池
+	if (!m_worker_list) {
+		return 1;
+	}
+	for (uint32_t i = 0; i < m_worker_size; i++) {
+		m_worker_list[i].SetThreadIdx(i);
+		m_worker_list[i].Start();
+	}
+	return 0;
+}
+````
+
+##### 4.3 初始化文件目录
+
+````c++
+g_fileManager = FileManager::getInstance(listen_ip, base_dir, fileCnt, filesPerDir);
+int ret = g_fileManager->initDir();
+if (ret) {
+    printf("The BaseDir is set incorrectly :%s\n",base_dir);
+    return ret;
+}
+
+//file entry
+struct Entry
+{
+    time_t m_lastAccess;
+    size_t m_fileSize;
+    u8* m_fileContent;
+    Entry() {
+        m_lastAccess = 0;
+        m_fileSize = 0;
+        m_fileContent = NULL;
+    }
+    ~Entry() {
+        if (m_fileContent)
+            delete [] m_fileContent;
+        m_fileContent = NULL;
+    }
+};
+//文件管理器
+FileManager(const char *host, const char *disk,int totFiles, int filesPerDir)//ip,base_dir,filecnt,filePerDir
+{
+    m_host = new char[strlen(host) + 1];
+    m_disk = new char[strlen(disk) + 1];
+    m_host[strlen(host)] = '\0';
+    m_disk[strlen(disk)] = '\0';
+    strncpy(m_host, host, strlen(host));//host
+    strncpy(m_disk, disk, strlen(disk));//base_dir
+    m_totFiles = totFiles;
+    m_filesPerDir = filesPerDir;
+    m_map.clear();//EntryMap m_map;  //typedef std::map<std::string, Entry*> EntryMap;
+}
+
+//初始化目录,构造一个base_dir/0~255/0~255 格式的目录
+int FileManager::initDir()
+{
+    bool isExist = File::isExist(m_disk);
+    if (!isExist)
+    {
+        u64 ret = File::mkdirNoRecursion(m_disk);
+        if (ret) {
+            log("The dir[%s] set error for code[%d], its parent dir may no exists", m_disk, ret);
+            return -1;
+        }
+    }
+    //255 X 255 
+    char first[10] = {0};
+    char second[10] = {0};
+    for (int i = 0; i <= FIRST_DIR_MAX; i++) {//FIRST_DIR_MAX=255
+        snprintf(first, 5, "%03d", i);
+        string tmp = string(m_disk) + "/" + string(first);//dir:  base_dir/0~255
+        int code = File::mkdirNoRecursion(tmp.c_str());//mkdir 0777
+        if (code && (errno != EEXIST)) {
+            log("Create dir[%s] error[%d]", tmp.c_str(), errno);
+            return -1;
+        }
+        for (int j = 0; j <= SECOND_DIR_MAX; j++) {//SECOND_DIR_MAX=255
+            snprintf(second, 5, "%03d", j);
+            string tmp2 = tmp + "/" + string(second);//dir:  base_dir/0~255/0~255
+            code = File::mkdirNoRecursion(tmp2.c_str());
+            if (code && (errno != EEXIST)) {
+                log("Create dir[%s] error[%d]", tmp2.c_str(), errno);
+                return -1;
+            }
+            memset(second, 0x0, 10);
+        }
+        memset(first, 0x0, 10);
+    }
+    return 0;
+}
+
+
+````
+
+##### 4.4 监听连接
+
+````c
+//在8700端口监听连接
+CStrExplode listen_ip_list(listen_ip, ';');
+for (uint32_t i = 0; i < listen_ip_list.GetItemCnt(); i++)
+{
+    ret = netlib_listen(listen_ip_list.GetItem(i), listen_port, http_callback, NULL);
+    if (ret == NETLIB_ERROR)
+        return ret;
+}
+//新连接回调函数
+void http_callback(void* callback_data, uint8_t msg, uint32_t handle, void* pParam)
+{
+    if (msg == NETLIB_MSG_CONNECT)
+    {
+        CHttpConn* pConn = new CHttpConn();//生成Http连接
+        pConn->OnConnect(handle);//执行
+    } else
+    {
+        log("!!!error msg: %d", msg);
+    }
+}
+
+void CHttpConn::OnConnect(net_handle_t handle)
+{
+    printf("OnConnect, handle=%d", handle);
+    m_sock_handle = handle;
+    m_state = CONN_STATE_CONNECTED;
+    g_http_conn_map.insert(make_pair(m_conn_handle, this));
+
+    netlib_option(handle, NETLIB_OPT_SET_CALLBACK, (void*) httpconn_callback);//设置回调函数
+    netlib_option(handle, NETLIB_OPT_SET_CALLBACK_DATA,reinterpret_cast<void *>(m_conn_handle));
+    netlib_option(handle, NETLIB_OPT_GET_REMOTE_IP, (void*) &m_peer_ip);
+}
+
+//根据事件进行对应的处理
+void httpconn_callback(void* callback_data, uint8_t msg, uint32_t handle,uint32_t uParam, void* pParam)
+{
+    NOTUSED_ARG(uParam);
+    NOTUSED_ARG(pParam);
+
+    // convert void* to uint32_t, oops
+    uint32_t conn_handle = *((uint32_t*) (&callback_data));
+    CHttpConn* pConn = FindHttpConnByHandle(conn_handle);
+    if (!pConn)
+    {
+        return;
+    }
+    switch (msg)
+    {
+    case NETLIB_MSG_READ:
+        pConn->OnRead();
+        break;
+    case NETLIB_MSG_WRITE:
+        pConn->OnWrite();
+        break;
+    case NETLIB_MSG_CLOSE:
+        pConn->OnClose();
+        break;
+    default:
+        log("!!!httpconn_callback error msg: %d", msg);
+        break;
+    }
+}
+
+//http发来请求
+void CHttpConn::OnRead()
+{
+    for (;;)//读取数据
+    {
+        uint32_t free_buf_len = m_in_buf.GetAllocSize()
+                - m_in_buf.GetWriteOffset();
+        if (free_buf_len < READ_BUF_SIZE + 1)
+            m_in_buf.Extend(READ_BUF_SIZE + 1);
+
+        int ret = netlib_recv(m_sock_handle,
+                m_in_buf.GetBuffer() + m_in_buf.GetWriteOffset(),
+                READ_BUF_SIZE);
+        if (ret <= 0)
+            break;
+        m_in_buf.IncWriteOffset(ret);//添加到读缓冲区
+        m_last_recv_tick = get_tick_count();//更新时间戳
+    }
+    // 每次请求对应一个HTTP连接，所以读完数据后，不用在同一个连接里面准备读取下个请求
+    char* in_buf = (char*) m_in_buf.GetBuffer();
+    uint32_t buf_len = m_in_buf.GetWriteOffset();
+    in_buf[buf_len] = '\0';
+    //log("OnRead, buf_len=%u, conn_handle=%u", buf_len, m_conn_handle); // for debug
+    m_HttpParser.ParseHttpContent(in_buf, buf_len);//解析内容
+    if (m_HttpParser.IsReadAll())
+    {
+        string strUrl = m_HttpParser.GetUrl();//url
+        log("IP:%s access:%s", m_peer_ip.c_str(), strUrl.c_str());
+        if (strUrl.find("..") != strUrl.npos) {
+            Close();
+            return;
+        }
+        m_access_host = m_HttpParser.GetHost();//host
+        if (m_HttpParser.GetContentLen() > HTTP_UPLOAD_MAX)//文件上传过大0xA00000,10M
+        {
+            // file is too big
+            log("content  is too big");
+            char url[128];
+            snprintf(url, sizeof(url), "{\"error_code\":1,\"error_msg\": \"上传文件过大\",\"url\":\"\"}");
+            log("%s",url);
+            uint32_t content_length = strlen(url);
+            char pContent[1024];
+            snprintf(pContent, sizeof(pContent), HTTP_RESPONSE_HTML, content_length,url);
+            //#define HTTP_RESPONSE_HTML          "HTTP/1.1 200 OK\r\n"\
+            //                        "Connection:close\r\n"\
+            //                        "Content-Length:%d\r\n"\
+            //                        "Content-Type:text/html;charset=utf-8\r\n\r\n%s"
+            Send(pContent, strlen(pContent));//回复
+            return;
+        }
+        int nContentLen = m_HttpParser.GetContentLen();//获取content
+        char* pContent = NULL;
+        if(nContentLen != 0)
+        {
+            try {
+                pContent =new char[nContentLen];
+                memcpy(pContent, m_HttpParser.GetBodyContent(), nContentLen);
+            }
+            catch(...)
+            {
+                log("not enough memory");
+                char szResponse[HTTP_RESPONSE_500_LEN + 1];
+                snprintf(szResponse, HTTP_RESPONSE_500_LEN, "%s", HTTP_RESPONSE_500);
+                Send(szResponse, HTTP_RESPONSE_500_LEN);//内存不足响应
+                return;
+            }
+        }
+        Request_t request;
+        request.conn_handle = m_conn_handle;
+        request.method = m_HttpParser.GetMethod();;
+        request.nContentLen = nContentLen;
+        request.pContent = pContent;
+        request.strAccessHost = m_HttpParser.GetHost();
+        request.strContentType = m_HttpParser.GetContentType();
+        request.strUrl = m_HttpParser.GetUrl() + 1;
+        CHttpTask* pTask = new CHttpTask(request);//http任务
+        if(HTTP_GET == m_HttpParser.GetMethod())//添加线程任务队里处理任务
+        {
+        	g_GetThreadPool.AddTask(pTask);
+        }
+        else
+        {
+        	g_PostThreadPool.AddTask(pTask);
+        }
+    }
+}
+
+//任务队列添加一个线程执行
+void CThreadPool::AddTask(CTask* pTask)
+{
+	/*
+	 * select a random thread to push task
+	 * we can also select a thread that has less task to do
+	 * but that will scan the whole thread list and use thread lock to get each task size
+	 */
+	uint32_t thread_idx = random() % m_worker_size;
+	m_worker_list[thread_idx].PushTask(pTask);
+}
+
+//run
+void CHttpTask::run()
+{
+    if(HTTP_GET == m_nMethod)
+        OnDownload();
+    else if(HTTP_POST == m_nMethod)
+       OnUpload();
+    else
+    {
+        char* pContent = new char[strlen(HTTP_RESPONSE_403)];
+        snprintf(pContent, strlen(HTTP_RESPONSE_403), HTTP_RESPONSE_403);
+        CHttpConn::AddResponsePdu(m_ConnHandle, pContent, strlen(pContent));//未知响应回复
+    }
+    if(m_pContent != NULL)
+    {
+        delete [] m_pContent;
+        m_pContent = NULL;
+    }
+}
+````
+
+##### 4.5 上传和下载
+
+````c++
+void  CHttpTask::OnDownload()
+{
+    uint32_t  nFileSize = 0;
+    int32_t nTmpSize = 0;
+    string strPath;
+    if(g_fileManager->getAbsPathByUrl(m_strUrl, strPath ) == 0)
+    {
+        nTmpSize = File::getFileSize((char*)strPath.c_str());
+        if(nTmpSize != -1)
+        {
+            char szResponseHeader[1024];
+            size_t nPos = strPath.find_last_of(".");
+            string strType = strPath.substr(nPos + 1, strPath.length() - nPos);//获得文件后缀名
+            if(strType == "jpg" || strType == "JPG" || strType == "jpeg" || strType == "JPEG" || strType == "png" || strType == "PNG" || strType == "gif" || strType == "GIF")
+            {
+                snprintf(szResponseHeader, sizeof(szResponseHeader), HTTP_RESPONSE_IMAGE, nTmpSize, strType.c_str());//图片
+                //#define HTTP_RESPONSE_IMAGE         "HTTP/1.1 200 OK\r\n"\
+                //                    "Connection:close\r\n"\
+                //                    "Content-Length:%d\r\n"\
+                //                    "Content-Type:image/%s\r\n\r\n"
+            }
+            else
+            {
+                snprintf(szResponseHeader,sizeof(szResponseHeader), HTTP_RESPONSE_EXTEND, nTmpSize);
+                //#define HTTP_RESPONSE_EXTEND        "HTTP/1.1 200 OK\r\n"\
+                //                    "Connection:close\r\n"\
+                //                    "Content-Length:%d\r\n"\
+                //                    "Content-Type:multipart/form-data\r\n\r\n"
+            }
+            int nLen = strlen(szResponseHeader);
+            char* pContent = new char[nLen + nTmpSize];
+            memcpy(pContent, szResponseHeader, nLen);
+            g_fileManager->downloadFileByUrl((char*)m_strUrl.c_str(), pContent + nLen, &nFileSize);//获取文件内容
+            int nTotalLen = nLen + nFileSize;
+            CHttpConn::AddResponsePdu(m_ConnHandle, pContent, nTotalLen);//添加到发送队列
+        }
+        else
+        {
+            int nTotalLen = strlen(HTTP_RESPONSE_404);
+            char* pContent = new char[nTotalLen];
+            snprintf(pContent, nTotalLen, HTTP_RESPONSE_404);
+            CHttpConn::AddResponsePdu(m_ConnHandle, pContent, nTotalLen);
+            log("File size is invalied\n");
+
+        }
+    }
+    else
+    {
+        int nTotalLen = strlen(HTTP_RESPONSE_500);
+        char* pContent = new char[nTotalLen];
+        snprintf(pContent, nTotalLen, HTTP_RESPONSE_500);
+        CHttpConn::AddResponsePdu(m_ConnHandle, pContent, nTotalLen);
+    }
+}
+````
+
+````c++
+void CHttpTask::OnUpload()
+{
+    //get the file original filename
+    char *pContent = NULL;
+        int nTmpLen = 0;
+        const char* pPos = memfind(m_pContent, m_nContentLen, CONTENT_DISPOSITION, strlen(CONTENT_DISPOSITION));//#define CONTENT_DISPOSITION         "Content-Disposition:" 
+        if (pPos != NULL)
+        {
+            nTmpLen = pPos - m_pContent;//"Content-Disposition:"的开始位置的长度
+            const char* pPos2 = memfind(pPos, m_nContentLen - nTmpLen, "filename=", strlen("filename="));//找到文件标签
+            if (pPos2 != NULL)
+            {
+                pPos = pPos2 + strlen("filename=") + 1;//文件名起始位置
+                const char * pPosQuotes = memfind(pPos, m_nContentLen - nTmpLen, "\"", strlen("\""));//找到文件末尾\r\n
+                int nFileNameLen = pPosQuotes - pPos;
+                char szFileName[256];
+                if(nFileNameLen <= 255)
+                {
+                    memcpy(szFileName,  pPos, nFileNameLen);//拷贝文件名
+                    szFileName[nFileNameLen] = 0;
+                    const char* pPosType = memfind(szFileName, nFileNameLen, ".", 1, false);//后缀名
+                    if(pPosType != NULL)
+                    {
+                        char szType[16];
+                        int nTypeLen = nFileNameLen - (pPosType + 1 - szFileName);
+                        if(nTypeLen <=15)
+                        {
+                            memcpy(szType, pPosType + 1, nTypeLen);
+                            szType[nTypeLen] = 0;
+                            log("upload file, file name:%s", szFileName);
+                            char szExtend[16];
+                            const char* pPosExtend = memfind(szFileName, nFileNameLen, "_", 1, false);
+                            if(pPosExtend != NULL)
+                            {
+                                const char* pPosTmp = memfind(pPosExtend, nFileNameLen - (pPosExtend + 1 - szFileName), "x", 1);
+                                if(pPosTmp != NULL)
+                                {
+                                    int nWidthLen = pPosTmp - pPosExtend - 1;
+                                    int nHeightLen = pPosType - pPosTmp - 1;
+                                    if(nWidthLen >= 0 && nHeightLen >= 0)
+                                    {
+                                        int nWidth = 0;
+                                        int nHeight = 0;
+                                        char szWidth[5], szHeight[5];
+                                        if(nWidthLen <=4 && nHeightLen <=4)
+                                        {
+                                            memcpy(szWidth, pPosExtend + 1, nWidthLen);
+                                            szWidth[nWidthLen] = 0;
+                                            memcpy(szHeight, pPosTmp + 1, nHeightLen );
+                                            szHeight[nHeightLen] = 0;
+                                            nWidth = atoi(szWidth);
+                                            nHeight = atoi(szHeight);
+                                            snprintf(szExtend, sizeof(szExtend), "%dx%d.%s", nWidth, nHeight, szType);
+                                        }else
+                                        {
+                                            szExtend[0] = 0;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        szExtend[0] = 0;
+                                    }
+                                }
+                                else{
+                                    szExtend[0] = 0;
+                                }
+                            }
+                            else
+                            {
+                                szExtend[0] = 0;
+                            }
+                            //get the file content
+                            size_t nPos = m_strContentType.find(BOUNDARY_MARK);
+                            if (nPos != m_strContentType.npos)
+                            {
+                                const  char* pBoundary = m_strContentType.c_str() + nPos + strlen(BOUNDARY_MARK);
+                                int nBoundaryLen = m_strContentType.length() - nPos - strlen(BOUNDARY_MARK);
+
+                                pPos = memfind(m_pContent, m_nContentLen, pBoundary, nBoundaryLen);
+                                if (NULL != pPos)
+                                {
+                                    nTmpLen = pPos - m_pContent;
+                                    pPos = memfind(m_pContent + nTmpLen, m_nContentLen - nTmpLen, CONTENT_TYPE, strlen(CONTENT_TYPE));
+                                    if (NULL != pPos)
+                                    {
+                                        nTmpLen = pPos - m_pContent;
+                                        pPos = memfind(m_pContent + nTmpLen, m_nContentLen - nTmpLen, HTTP_END_MARK, strlen(HTTP_END_MARK));
+                                        if (NULL != pPos)
+                                        {
+                                            nTmpLen = pPos - m_pContent;
+                                            const char* pFileStart = pPos + strlen(HTTP_END_MARK);
+                                            pPos2 = memfind(m_pContent + nTmpLen, m_nContentLen - nTmpLen, pBoundary, nBoundaryLen);
+                                            if (NULL != pPos2)
+                                            {
+                                                int64_t nFileSize = pPos2 - strlen(HTTP_END_MARK) - pFileStart;
+                                                if (nFileSize <= HTTP_UPLOAD_MAX)
+                                                {
+                                                    char filePath[512] =
+                                                    { 0 };
+                                                    if(strlen(szExtend) != 0)
+                                                    {
+                                                        g_fileManager->uploadFile(szType, pFileStart, nFileSize, filePath, szExtend);
+                                                    }
+                                                    else{
+                                                        g_fileManager->uploadFile(szType, pFileStart, nFileSize, filePath);
+                                                    }
+                                                    char url[1024];
+                                                    snprintf(url, sizeof(url), "{\"error_code\":0,\"error_msg\": \"成功\",\"path\":\"%s\",\"url\":\"http://%s/%s\"}", filePath,m_strAccessHost.c_str(), filePath);
+                                                    uint32_t content_length = strlen(url);
+                                                    pContent = new char[HTTP_RESPONSE_HTML_MAX];
+                                                    snprintf(pContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, content_length,url);
+                                                    CHttpConn::AddResponsePdu(m_ConnHandle, pContent, strlen(pContent));
+                                                }
+                                            }
+                                            else
+                                            {
+                                                char url[128];
+                                                snprintf(url, sizeof(url), "{\"error_code\":8,\"error_msg\": \"格式错误\",\"path\":\"\",\"url\":\"\"}");
+                                                log("%s",url);
+                                                uint32_t content_length = strlen(url);
+                                                pContent = new char[HTTP_RESPONSE_HTML_MAX];
+                                                snprintf(pContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, content_length,url);
+                                                CHttpConn::AddResponsePdu(m_ConnHandle, pContent, strlen(pContent));
+                                            }
+                                        }
+                                        else
+                                        {
+                                            char url[128];
+                                            snprintf(url, sizeof(url), "{\"error_code\":7,\"error_msg\": \"格式错误\",\"path\":\"\",\"url\":\"\"}");
+                                            log("%s",url);
+                                            uint32_t content_length = strlen(url);
+                                            pContent = new char[HTTP_RESPONSE_HTML_MAX];
+                                            snprintf(pContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, content_length,url);
+                                            CHttpConn::AddResponsePdu(m_ConnHandle, pContent, strlen(pContent));
+                                        }
+                                    }
+                                    else
+                                    {
+                                        char url[128];
+                                        snprintf(url, sizeof(url), "{\"error_code\":6,\"error_msg\": \"格式错误\",\"path\":\"\",\"url\":\"\"}");
+                                        log("%s",url);
+                                        uint32_t content_length = strlen(url);
+                                        pContent = new char[HTTP_RESPONSE_HTML_MAX];
+                                        snprintf(pContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, content_length,url);
+                                        CHttpConn::AddResponsePdu(m_ConnHandle, pContent, strlen(pContent));
+                                    }
+                                }
+                                else
+                                {
+                                    char url[128];
+                                    snprintf(url, sizeof(url), "{\"error_code\":5,\"error_msg\": \"格式错误\",\"path\":\"\",\"url\":\"\"}");
+                                    log("%s",url);
+                                    uint32_t content_length = strlen(url);
+                                    pContent = new char[HTTP_RESPONSE_HTML_MAX];
+                                    snprintf(pContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, content_length,url);
+                                    CHttpConn::AddResponsePdu(m_ConnHandle, pContent, strlen(pContent));
+                                }
+                            }
+                            else
+                            {
+                                char url[128];
+                                snprintf(url, sizeof(url), "{\"error_code\":4,\"error_msg\": \"格式错误\",\"path\":\"\",\"url\":\"\"}");
+                                log("%s",url);
+                                uint32_t content_length = strlen(url);
+                                pContent = new char[HTTP_RESPONSE_HTML_MAX];
+                                snprintf(pContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, content_length,url);
+                                CHttpConn::AddResponsePdu(m_ConnHandle, pContent, strlen(pContent));
+                            }
+                        }
+                        else{
+                            char url[128];
+                            snprintf(url, sizeof(url), "{\"error_code\":9,\"error_msg\": \"格式错误\",\"path\":\"\",\"url\":\"\"}");
+                            log("%s",url);
+                            uint32_t content_length = strlen(url);
+                            pContent = new char[HTTP_RESPONSE_HTML_MAX];
+                            snprintf(pContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, content_length,url);
+                            CHttpConn::AddResponsePdu(m_ConnHandle, pContent, strlen(pContent));
+                        }
+                   }
+                   else{
+                       char url[128];
+                       snprintf(url, sizeof(url), "{\"error_code\":10,\"error_msg\": \"格式错误\",\"path\":\"\",\"url\":\"\"}");
+                       log("%s",url);
+                       uint32_t content_length = strlen(url);
+                       pContent = new char[HTTP_RESPONSE_HTML_MAX];
+                       snprintf(pContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, content_length,url);
+                       CHttpConn::AddResponsePdu(m_ConnHandle, pContent, strlen(pContent));
+                   }
+                }else
+                {
+                    char url[128];
+                    snprintf(url, sizeof(url), "{\"error_code\":11,\"error_msg\": \"格式错误\",\"path\":\"\",\"url\":\"\"}");
+                    log("%s",url);
+                    uint32_t content_length = strlen(url);
+                    pContent = new char[HTTP_RESPONSE_HTML_MAX];
+                    snprintf(pContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, content_length,url);
+                    CHttpConn::AddResponsePdu(m_ConnHandle, pContent, strlen(pContent));
+                }
+            }
+            else
+            {
+                char url[128];
+                snprintf(url, sizeof(url), "{\"error_code\":3,\"error_msg\": \"格式错误\",\"path\":\"\",\"url\":\"\"}");
+                log("%s",url);
+                uint32_t content_length = strlen(url);
+                pContent = new char[HTTP_RESPONSE_HTML_MAX];
+                snprintf(pContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, content_length,url);
+                CHttpConn::AddResponsePdu(m_ConnHandle, pContent, strlen(pContent));
+            }
+        }
+        else
+        {
+            char url[128];
+            snprintf(url, sizeof(url), "{\"error_code\":2,\"error_msg\": \"格式错误\",\"path\":\"\",\"url\":\"\"}");
+            log("%s",url);
+            uint32_t content_length = strlen(url);
+            pContent = new char[HTTP_RESPONSE_HTML_MAX];
+            snprintf(pContent, HTTP_RESPONSE_HTML_MAX, HTTP_RESPONSE_HTML, content_length,url);
+            CHttpConn::AddResponsePdu(m_ConnHandle, pContent, strlen(pContent));
+        }
+}
+````
+
+#### 5.fileServer文件服务器
+
+​		文件服务器的架构和上面几个服务器的架构都是一样的，就不说明了。
+
+​		主要学习一下文件传输，msg_server的消息转发，file_server的处理方式。
+
+​		客户端按需求和file_server文件服务区连接，属于短连接。msg_server一直和file_server连接的，属于长连接。
+
+​		msg_server连接file_server的8601端口，连接成功后会发送请求给fileServer，获取侦听的客户端的ip和端口。
+
+##### 5.1 客户端连接MsgServer
+
+````c
+//MsgServer连接上FileServer后，发送获取文件服务器IP信息的请求
+void CFileServConn::OnConfirm()
+{
+	log("connect to file server success ");
+	m_bOpen = true;
+	m_connect_time = get_tick_count();
+	g_file_server_list[m_serv_idx].reconnect_cnt = MIN_RECONNECT_CNT / 2;   
+    //连上file_server以后，给file_server发送获取ip地址的数据包
+    IM::Server::IMFileServerIPReq msg;
+    CImPdu pdu;
+    pdu.SetPBMsg(&msg);
+    pdu.SetServiceId(SID_OTHER);
+    pdu.SetCommandId(CID_OTHER_FILE_SERVER_IP_REQ);//MsgServer连接上FileServer后，发送获取文件服务器IP信息的请求
+    SendPdu(&pdu);
+}
+//FileServer收到请求后，返回数据
+void FileMsgServerConn::HandlePdu(CImPdu* pdu) 
+{
+    switch (pdu->GetCommandId()) {
+        case CID_OTHER_HEARTBEAT:
+            _HandleHeartBeat(pdu);
+            break;
+        case CID_OTHER_FILE_TRANSFER_REQ:
+            _HandleMsgFileTransferReq(pdu);
+            break ;
+           //msg_server连接file_server成功以后发来查询file_server的ip地址的命令号
+        case CID_OTHER_FILE_SERVER_IP_REQ:
+            _HandleGetServerAddressReq(pdu);
+            break;
+        default:
+            log("No such cmd id = %u", pdu->GetCommandId());
+            break;
+    }
+}
+//返回fileServer侦听的客户端的ip地址和端口。
+//客户端得到的是fileServer侦听的ip和port,默认配置的端口号是8600.
+//即fileServer的8600端口和客户端连接。8601端口用来和MsgServer连接
+void FileMsgServerConn::_HandleGetServerAddressReq(CImPdu* pPdu)
+{
+    IM::Server::IMFileServerIPRsp msg;
+    const std::list<IM::BaseDefine::IpAddr>& addrs = ConfigUtil::GetInstance()->GetAddressList();//获取服务器的ip地址、port信息
+    for (std::list<IM::BaseDefine::IpAddr>::const_iterator it=addrs.begin(); it!=addrs.end(); ++it)
+    {
+        IM::BaseDefine::IpAddr* addr = msg.add_ip_addr_list();
+        *addr = *it;
+        log("Upload file_client_conn addr info, ip=%s, port=%d", addr->ip().c_str(), addr->port());
+    }
+    SendMessageLite(this, SID_OTHER, CID_OTHER_FILE_SERVER_IP_RSP, pPdu->GetSeqNum(), &msg);
+}
+
+````
+
+##### 5.2  MsgServer请求FileServer
+
+````c++
+//客户端要进行文件传输时
+//1.客户端发送消息给MsgServer要进行文件传输。
+//2.MsgServer返回FileServer的ip和8601端口。
+//3.客户端根据FilerServer的ip 和port连接，然后传输文件
+
+//1.MsgServer对客户端请求的处理
+void CMsgConn::HandlePdu(CImPdu* pPdu)
+{
+    ...
+    switch (pPdu->GetCommandId())
+    {
+        ...
+        case CID_FILE_REQUEST:
+            s_file_handler->HandleClientFileRequest(this, pPdu);
+        ...
+    }
+    ...
+}
+//2.MsgServer获得Client文件请求后，解析出文件信息以及目标对象信息
+//若是离线文件，则将消息发给文件服务器，发送文件服务器的请求时CID_OTHER_FILE_TRANSFER_REQ
+//若是在线文件，且可以查询到对方的登录状态，也将消息发给文件服务器。否则向RouteServer查询
+void CFileHandler::HandleClientFileRequest(CMsgConn* pMsgConn, CImPdu* pPdu)
+{
+    IM::File::IMFileReq msg;
+    CHECK_PB_PARSE_MSG(msg.ParseFromArray(pPdu->GetBodyData(), pPdu->GetBodyLength()));
+    uint32_t from_id = pMsgConn->GetUserId();//发送文件的用户id
+    uint32_t to_id = msg.to_user_id();//接收文件的用户id
+    string file_name = msg.file_name();//文件名称
+    uint32_t file_size = msg.file_size();//文件大小
+    uint32_t trans_mode = msg.trans_mode();//传输模式
+    log("HandleClientFileRequest, %u->%u, fileName: %s, trans_mode: %u.", from_id, to_id, file_name.c_str(), trans_mode);
+    CDbAttachData attach(ATTACH_TYPE_HANDLE, pMsgConn->GetHandle());
+    CFileServConn* pFileConn = get_random_file_serv_conn();//获得文件服务器的连接
+    if (pFileConn)
+    {
+        IM::Server::IMFileTransferReq msg2;//构件文件传输请求
+        msg2.set_from_user_id(from_id);
+        msg2.set_to_user_id(to_id);
+        msg2.set_file_name(file_name);
+        msg2.set_file_size(file_size);
+        msg2.set_trans_mode((IM::BaseDefine::TransferFileType)trans_mode);
+        msg2.set_attach_data(attach.GetBuffer(), attach.GetLength());//添加文件buffer
+        CImPdu pdu;
+        pdu.SetPBMsg(&msg2);
+        pdu.SetServiceId(SID_OTHER);
+        pdu.SetCommandId(CID_OTHER_FILE_TRANSFER_REQ);//CID_OTHER_FILE_TRANSFER_REQ
+        pdu.SetSeqNum(pPdu->GetSeqNum());
+        if (IM::BaseDefine::FILE_TYPE_OFFLINE == trans_mode)//离线传输
+        {
+            pFileConn->SendPdu(&pdu);//将文件发送给文件服务器
+        }
+        else //IM::BaseDefine::FILE_TYPE_ONLINE //在线传输
+        {
+            CImUser* pUser = CImUserManager::GetInstance()->GetImUserById(to_id);
+            if (pUser && pUser->GetPCLoginStatus())//已有对应的账号pc登录状态
+            {
+                pFileConn->SendPdu(&pdu);//PC登录，发送PC
+            }
+            else//无对应用户的pc登录状态,向route_server查询状态
+            {
+                //no pc_client in this msg_server, check it from route_server
+                CPduAttachData attach_data(ATTACH_TYPE_HANDLE_AND_PDU_FOR_FILE, pMsgConn->GetHandle(), pdu.GetBodyLength(), pdu.GetBodyData());
+                IM::Buddy::IMUsersStatReq msg3;//
+                msg3.set_user_id(from_id);
+                msg3.add_user_id_list(to_id);
+                msg3.set_attach_data(attach_data.GetBuffer(), attach_data.GetLength());
+                CImPdu pdu2;
+                pdu2.SetPBMsg(&msg3);
+                pdu2.SetServiceId(SID_BUDDY_LIST);//查询伙伴列表
+                pdu2.SetCommandId(CID_BUDDY_LIST_USERS_STATUS_REQUEST);//
+                pdu2.SetSeqNum(pPdu->GetSeqNum());
+                CRouteServConn* route_conn = get_route_serv_conn();//获得route_server连接
+                if (route_conn)
+                {
+                    route_conn->SendPdu(&pdu2);//发送给route_server
+                }
+            }
+        }
+    }
+    else//文件服务器无法连接
+    {
+        log("HandleClientFileRequest, no file server.   ");
+        IM::File::IMFileRsp msg2;
+        msg2.set_result_code(1);
+        msg2.set_from_user_id(from_id);
+        msg2.set_to_user_id(to_id);
+        msg2.set_file_name(file_name);
+        msg2.set_task_id("");
+        msg2.set_trans_mode((IM::BaseDefine::TransferFileType)trans_mode);
+        CImPdu pdu;
+        pdu.SetPBMsg(&msg2);
+        pdu.SetServiceId(SID_FILE);
+        pdu.SetCommandId(CID_FILE_RESPONSE);
+        pdu.SetSeqNum(pPdu->GetSeqNum());
+        pMsgConn->SendPdu(&pdu);//向发来消息的客户端连接回复
+    }
+}
+````
+
+##### 5.3 FileServer的对MsgServer的消息的处理
+
+````c++
+//FileServer收到消息后，生成传输任务，并将传入任务丢入传输队列
+//然后回复MsgServer
+void FileMsgServerConn::HandlePdu(CImPdu* pdu) 
+{
+    switch (pdu->GetCommandId())
+    {
+    	case CID_OTHER_FILE_TRANSFER_REQ://CID_OTHER_FILE_TRANSFER_REQ
+            _HandleMsgFileTransferReq(pdu);
+            break ;        
+    }
+}
+//
+void FileMsgServerConn::_HandleMsgFileTransferReq(CImPdu* pdu)
+{
+    IM::Server::IMFileTransferReq transfer_req;
+    CHECK_PB_PARSE_MSG(transfer_req.ParseFromArray(pdu->GetBodyData(), pdu->GetBodyLength()));
+    uint32_t from_id = transfer_req.from_user_id();//解析发送用户id
+    uint32_t to_id = transfer_req.to_user_id();//解析目标用户id
+    IM::Server::IMFileTransferRsp transfer_rsp;//文件传输请求
+    transfer_rsp.set_result_code(1);//设置传输请求的属性
+    transfer_rsp.set_from_user_id(from_id);
+    transfer_rsp.set_to_user_id(to_id);
+    transfer_rsp.set_file_name(transfer_req.file_name());
+    transfer_rsp.set_file_size(transfer_req.file_size());
+    transfer_rsp.set_task_id("");
+    transfer_rsp.set_trans_mode(transfer_req.trans_mode());
+    transfer_rsp.set_attach_data(transfer_req.attach_data());
+    bool rv = false;
+    do {
+        std::string task_id = GenerateUUID();
+        if (task_id.empty()) {
+            log("Create task id failed");
+            break;
+        }
+        log("trams_mode=%d, task_id=%s, from_id=%d, to_id=%d, file_name=%s, file_size=%d", transfer_req.trans_mode(), task_id.c_str(), from_id, to_id, transfer_req.file_name().c_str(), transfer_req.file_size());
+        //创建传输任务，内部会将任务添加到传输队列
+        BaseTransferTask* transfer_task = TransferTaskManager::GetInstance()->NewTransferTask(
+                                                                                              transfer_req.trans_mode(),
+                                                                                              task_id,
+                                                                                              from_id,
+                                                                                              to_id,
+                                                                                              transfer_req.file_name(),
+                                                                                              transfer_req.file_size());
+        if (transfer_task == NULL) {
+            // 创建未成功
+            // close connection with msg svr
+            // need_close = true;
+            log("Create task failed");
+            break;
+        }
+        
+        transfer_rsp.set_result_code(0);
+        transfer_rsp.set_task_id(task_id);
+        rv = true;
+        // need_seq_no = false;
+        
+        log("Create task succeed, task id %s, task type %d, from user %d, to user %d", task_id.c_str(), transfer_req.trans_mode(), from_id, to_id);
+    } while (0);
+    
+    //发送传输请求
+    ::SendMessageLite(this, SID_OTHER, CID_OTHER_FILE_TRANSFER_RSP, pdu->GetSeqNum(), &transfer_rsp);//CID_OTHER_FILE_TRANSFER_RSP
+    
+    if (!rv) {
+        // 未创建成功，关闭连接
+        Close();
+    }
+}
+//添加传输任务到传输队列。
+BaseTransferTask* TransferTaskManager::NewTransferTask(uint32_t trans_mode, const std::string& task_id, uint32_t from_user_id, uint32_t to_user_id, const std::string& file_name, uint32_t file_size) {
+    BaseTransferTask* transfer_task = NULL;
+    TransferTaskMap::iterator it = transfer_tasks_.find(task_id);
+    if (it==transfer_tasks_.end()) {
+        if (trans_mode == IM::BaseDefine::FILE_TYPE_ONLINE) {//在线
+            transfer_task = new OnlineTransferTask(task_id, from_user_id, to_user_id, file_name, file_size);
+        } else if (trans_mode == IM::BaseDefine::FILE_TYPE_OFFLINE) {//离线
+            transfer_task = new OfflineTransferTask(task_id, from_user_id, to_user_id, file_name, file_size);
+        } else {
+            log("Invalid trans_mode = %d", trans_mode);
+        }
+        
+        if (transfer_task) {
+            transfer_tasks_.insert(std::make_pair(task_id, transfer_task));//添加到传输队列里
+        }
+    } else {
+        log("Task existed by task_id=%s, why?????", task_id.c_str());
+    }
+    return transfer_task;
+}
+
+
+
+//回复,CID_OTHER_FILE_TRANSFER_RSP
+int SendMessageLite(CImConn* conn, uint16_t sid, uint16_t cid, uint16_t seq_num, const ::google::protobuf::MessageLite* message)
+{
+    CImPdu pdu;
+    pdu.SetPBMsg(message);
+    pdu.SetServiceId(sid);
+    pdu.SetCommandId(cid);
+    pdu.SetSeqNum(seq_num);
+    return conn->SendPdu(&pdu);//回复MsgServer
+}
+````
+
+##### 5.4 MsgServer处理FileServer的文件传输响应
+
+````c++
+//MsgServer收到FileServer的回复后，开始进行将FileServer的ip和端口等信息返回给客户端。
+//同时通知远程客户端，若远程客户端不在同一个MsgServer，则通过RouteServer进行通知。
+void CFileServConn::HandlePdu(CImPdu* pPdu)
+{
+	switch (pPdu->GetCommandId()) {
+        case CID_OTHER_HEARTBEAT:
+            break;
+        case CID_OTHER_FILE_TRANSFER_RSP:
+            _HandleFileMsgTransRsp(pPdu);//
+            break;
+        case CID_OTHER_FILE_SERVER_IP_RSP:
+            _HandleFileServerIPRsp(pPdu);
+            break;
+        default:
+            log("unknown cmd id=%d ", pPdu->GetCommandId());
+            break;
+	}
+}
+//处理FileServer的响应
+void CFileServConn::_HandleFileMsgTransRsp(CImPdu* pPdu)
+{
+    IM::Server::IMFileTransferRsp msg;
+    CHECK_PB_PARSE_MSG(msg.ParseFromArray(pPdu->GetBodyData(), pPdu->GetBodyLength()));
+
+    uint32_t result = msg.result_code();
+    uint32_t from_id = msg.from_user_id();
+    uint32_t to_id = msg.to_user_id();
+    string file_name = msg.file_name();
+    uint32_t file_size = msg.file_size();
+    string task_id = msg.task_id();
+    uint32_t trans_mode = msg.trans_mode();
+    CDbAttachData attach((uchar_t*)msg.attach_data().c_str(), msg.attach_data().length());
+    log("HandleFileMsgTransRsp, result: %u, from_user_id: %u, to_user_id: %u, file_name: %s, \
+        task_id: %s, trans_mode: %u. ", result, from_id, to_id,
+        file_name.c_str(), task_id.c_str(), trans_mode);
+
+    const list<IM::BaseDefine::IpAddr>* ip_addr_list = GetFileServerIPList();//获得文件服务器的列表
+
+    IM::File::IMFileRsp msg2;
+    msg2.set_result_code(result);
+    msg2.set_from_user_id(from_id);
+    msg2.set_to_user_id(to_id);
+    msg2.set_file_name(file_name);
+    msg2.set_task_id(task_id);
+    msg2.set_trans_mode((IM::BaseDefine::TransferFileType)trans_mode);
+    for (list<IM::BaseDefine::IpAddr>::const_iterator it = ip_addr_list->begin(); it != ip_addr_list->end(); it++)//编译文件服务器列表
+    {	//设置文件服务器的信息
+        IM::BaseDefine::IpAddr ip_addr_tmp = *it;
+        IM::BaseDefine::IpAddr* ip_addr = msg2.add_ip_addr_list();
+        ip_addr->set_ip(ip_addr_tmp.ip());
+        ip_addr->set_port(ip_addr_tmp.port());
+    }
+    CImPdu pdu;
+    pdu.SetPBMsg(&msg2);
+    pdu.SetServiceId(SID_FILE);
+    pdu.SetCommandId(CID_FILE_RESPONSE);
+    pdu.SetSeqNum(pPdu->GetSeqNum());
+    uint32_t handle = attach.GetHandle();
+    
+    CMsgConn* pFromConn = CImUserManager::GetInstance()->GetMsgConnByHandle(from_id, handle);//查找客户端连接
+    if (pFromConn)
+    {
+        pFromConn->SendPdu(&pdu);//返回连接
+    }
+    
+    if (result == 0)
+    {
+        IM::File::IMFileNotify msg3;
+        msg3.set_from_user_id(from_id);
+        msg3.set_to_user_id(to_id);
+        msg3.set_file_name(file_name);
+        msg3.set_file_size(file_size);
+        msg3.set_task_id(task_id);
+        msg3.set_trans_mode((IM::BaseDefine::TransferFileType)trans_mode);
+        msg3.set_offline_ready(0);
+        for (list<IM::BaseDefine::IpAddr>::const_iterator it = ip_addr_list->begin(); it != ip_addr_list->end(); it++)
+        {
+            IM::BaseDefine::IpAddr ip_addr_tmp = *it;
+            IM::BaseDefine::IpAddr* ip_addr = msg3.add_ip_addr_list();
+            ip_addr->set_ip(ip_addr_tmp.ip());
+            ip_addr->set_port(ip_addr_tmp.port());
+        }
+        CImPdu pdu2;
+        pdu2.SetPBMsg(&msg3);
+        pdu2.SetServiceId(SID_FILE);
+        pdu2.SetCommandId(CID_FILE_NOTIFY);
+        
+        //send notify to target user
+        CImUser* pToUser = CImUserManager::GetInstance()->GetImUserById(to_id);//发送注意事件消息给目的用户
+        if (pToUser)//若在同一个MsgServer上，则直接发送
+        {
+            pToUser->BroadcastPduWithOutMobile(&pdu2);//发送notify广播
+        }
+        
+        //send to route server
+        CRouteServConn* pRouteConn = get_route_serv_conn();
+        if (pRouteConn) {
+            pRouteConn->SendPdu(&pdu2);//否则发送给route_Server，让它转发
+        }
+    }
+}
+````
+
+##### 5.5 FileServer对于另一个client登录的处理
+
+````c++
+//处理另一个客户端登录
+//远程客户端在收到MsgServer的notify之后，开始连接FileServer
+void FileClientConn::HandlePdu(CImPdu* pdu) 
+{
+    sitch (pdu->GetCommandId()) {
+        case CID_FILE_LOGIN_REQ:
+            _HandleClientFileLoginReq(pdu);
+            break;
+    }
+}
+
+// 客户端登录FileServer时，检查FileServer是否有传输任务
+// 
+void FileClientConn::_HandleClientFileLoginReq(CImPdu* pdu) {
+    IM::File::IMFileLoginReq login_req;
+    CHECK_PB_PARSE_MSG(login_req.ParseFromArray(pdu->GetBodyData(), pdu->GetBodyLength()));
+    
+    uint32_t user_id = login_req.user_id();
+    string task_id = login_req.task_id();
+    IM::BaseDefine::ClientFileRole mode = login_req.file_role();
+    
+    log("Client login, user_id=%d, task_id=%s, file_role=%d", user_id, task_id.c_str(), mode);
+    
+    BaseTransferTask* transfer_task = NULL;
+    
+    bool rv = false;
+    do {
+        // 查找任务是否存在
+        transfer_task = TransferTaskManager::GetInstance()->FindByTaskID(task_id);//获取传输队列的传输任务
+        if (transfer_task == NULL) {
+            if (mode == CLIENT_OFFLINE_DOWNLOAD) {
+                // 文件不存在，检查是否是离线下载，有可能是文件服务器重启
+                // 尝试从磁盘加载
+                transfer_task = TransferTaskManager::GetInstance()->NewTransferTask(task_id, user_id);
+                // 需要再次判断是否加载成功
+                if (transfer_task == NULL) {
+                    log("Find task id failed, user_id=%u, taks_id=%s, mode=%d", user_id, task_id.c_str(), mode);
+                    break;
+                }
+            } else {
+                log("Can't find task_id, user_id=%u, taks_id=%s, mode=%d", user_id, task_id.c_str(), mode);
+                break;
+            }
+        }
+        // 状态转换
+        rv = transfer_task->ChangePullState(user_id, mode);
+        if (!rv) {
+            // log();
+            break;
+            //
+        }
+        // Ok
+        auth_ = true;
+        transfer_task_ = transfer_task;
+        user_id_ = user_id;
+        // 设置conn
+        transfer_task->SetConnByUserID(user_id, this);
+        rv = true;
+        
+    } while (0);
+    IM::File::IMFileLoginRsp login_rsp;
+    login_rsp.set_result_code(rv?0:1);
+    login_rsp.set_task_id(task_id);
+    ::SendMessageLite(this, SID_FILE, CID_FILE_LOGIN_RES, pdu->GetSeqNum(), &login_rsp);
+    if (rv) 
+    {
+        if (transfer_task->GetTransMode() == FILE_TYPE_ONLINE) {//在线文件
+            if (transfer_task->state() == kTransferTaskStateWaitingTransfer)//处于等待传输的状态
+            {
+                CImConn* conn = transfer_task_->GetToConn();//获得客户端的连接
+                if (conn) 
+                {
+                    _StatesNotify(CLIENT_FILE_PEER_READY, task_id, transfer_task_->from_user_id(), conn);//唤醒源客户端
+                } else {
+                    log("to_conn is close, close me!!!");
+                    Close();
+                }
+                // _StatesNotify(CLIENT_FILE_PEER_READY, task_id, user_id, this);
+                // transfer_task->StatesNotify(CLIENT_FILE_PEER_READY, task_id, user_id_);
+            }
+        } else //离线文件
+        {
+            if (transfer_task->state() == kTransferTaskStateWaitingUpload) //等待上传
+            {    
+                OfflineTransferTask* offline = reinterpret_cast<OfflineTransferTask*>(transfer_task);  //转换成离线传输任务 
+                IM::File::IMFilePullDataReq pull_data_req;
+                pull_data_req.set_task_id(task_id);
+                pull_data_req.set_user_id(user_id);
+                pull_data_req.set_trans_mode(FILE_TYPE_OFFLINE);
+                pull_data_req.set_offset(0);
+                pull_data_req.set_data_size(offline->GetNextSegmentBlockSize());
+                ::SendMessageLite(this, SID_FILE, CID_FILE_PULL_DATA_REQ, &pull_data_req);//向客户端发送获取离线传输数据的请求。
+
+                log("Pull Data Req");
+            }
+        }
+    } else {
+        Close();
+    }
+}
+
+//在线文件传输，向源客户端发起 CID_FILE_STATE 请求
+int FileClientConn::_StatesNotify(int state, const std::string& task_id, uint32_t user_id, CImConn* conn)
+{
+    FileClientConn* file_client_conn = reinterpret_cast<FileClientConn*>(conn);
+    IM::File::IMFileState file_msg;
+    file_msg.set_state(static_cast<ClientFileState>(state));
+    file_msg.set_task_id(task_id);
+    file_msg.set_user_id(user_id);
+    ::SendMessageLite(conn, SID_FILE, CID_FILE_STATE, &file_msg);
+    log("notify to user %d state %d task %s", user_id, state, task_id.c_str());
+    return 0;
+}
+
+//客户端上传文件
+void FileClientConn::_HandleClientFilePullFileRsp(CImPdu *pdu) {
+    if (!auth_ || !transfer_task_) {
+        log("auth is false");
+        return;
+    }
+    // 只有rsp
+    IM::File::IMFilePullDataRsp pull_data_rsp;
+    CHECK_PB_PARSE_MSG(pull_data_rsp.ParseFromArray(pdu->GetBodyData(), pdu->GetBodyLength()));
+    
+    uint32_t user_id = pull_data_rsp.user_id();
+    string task_id = pull_data_rsp.task_id();
+    uint32_t offset = pull_data_rsp.offset();
+    uint32_t data_size = static_cast<uint32_t>(pull_data_rsp.file_data().length());
+    const char* data = pull_data_rsp.file_data().data();//文件数据
+
+    // log("Recv FilePullFileRsp, user_id=%d, task_id=%s, file_role=%d, offset=%d, datasize=%d", user_id, task_id.c_str(), mode, offset, datasize);
+    log("Recv FilePullFileRsp, task_id=%s, user_id=%u, offset=%u, data_size=%d", task_id.c_str(), user_id, offset, data_size);
+
+    int rv = -1;
+    do {
+        // 检查user_id
+        if (user_id != user_id_) {
+            log("Received user_id valid, recv_user_id = %d, transfer_task.user_id = %d, user_id_ = %d", user_id, transfer_task_->from_user_id(), user_id_);
+            break;
+        }
+        // 检查task_id
+        if (transfer_task_->task_id() != task_id) {
+            log("Received task_id valid, recv_task_id = %s, this_task_id = %s", task_id.c_str(), transfer_task_->task_id().c_str());
+            // Close();
+            break;
+        }
+        rv = transfer_task_->DoRecvData(user_id, offset, data, data_size);//检测有无收完数据
+        if (rv == -1) {
+            break;
+        }
+        if (transfer_task_->GetTransMode() == FILE_TYPE_ONLINE) {
+            // 对于在线，直接转发
+            OnlineTransferTask* online = reinterpret_cast<OnlineTransferTask*>(transfer_task_);
+            pdu->SetSeqNum(online->GetSeqNum());
+            // online->SetSeqNum(pdu->GetSeqNum());
+
+            CImConn* conn = transfer_task_->GetToConn();
+            if (conn) {
+                conn->SendPdu(pdu);//发送给对端客户端
+            }
+        } else {
+            // 离线
+            // all packages recved
+            if (rv == 1) {
+                _StatesNotify(CLIENT_FILE_DONE, task_id, user_id, this);//上传完成
+                // Close();
+            } else {
+                OfflineTransferTask* offline = reinterpret_cast<OfflineTransferTask*>(transfer_task_);//离线传输任务
+                IM::File::IMFilePullDataReq pull_data_req;
+                pull_data_req.set_task_id(task_id);
+                pull_data_req.set_user_id(user_id);
+                pull_data_req.set_trans_mode(static_cast<IM::BaseDefine::TransferFileType>(offline->GetTransMode()));
+                pull_data_req.set_offset(offline->GetNextOffset());
+                pull_data_req.set_data_size(offline->GetNextSegmentBlockSize());
+                ::SendMessageLite(this, SID_FILE, CID_FILE_PULL_DATA_REQ, &pull_data_req);
+                // log("size not match");
+            }
+        }
+    } while (0);
+    if (rv!=0) {
+        // -1，出错关闭
+        //  1, 离线上传完成
+        Close();
+    }
+}
+````
+
+
+
 
 
 

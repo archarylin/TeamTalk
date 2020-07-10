@@ -102,7 +102,7 @@ int main(int argc, char* argv[])
 		return ret;
 
     CStrExplode client_listen_ip_list(str_client_listen_ip, ';');
-    //ÔÚ8600ÉÏÕìÌı¿Í»§¶ËÁ¬½Ó
+    //ï¿½ï¿½8600ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 	for (uint32_t i = 0; i < client_listen_ip_list.GetItemCnt(); i++) {
 		ret = netlib_listen(client_listen_ip_list.GetItem(i), client_listen_port, FileClientConnCallback, NULL);
         if (ret == NETLIB_ERROR) {
@@ -113,7 +113,7 @@ int main(int argc, char* argv[])
         }
 	}
 
-    //ÔÚ8601ÉÏÕìÌımsg_serverµÄÁ¬½Ó
+    //ï¿½ï¿½8601ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½msg_serverï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
     ret = netlib_listen(str_msg_server_listen_ip, msg_server_listen_port, FileMsgServerConnCallback, NULL);
     if (ret == NETLIB_ERROR) {
         printf("listen %s:%d error!!\n", str_msg_server_listen_ip, msg_server_listen_port);
