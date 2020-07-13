@@ -3906,7 +3906,299 @@ void FileClientConn::_HandleClientFilePullFileRsp(CImPdu *pdu) {
 }
 ````
 
+FileServer对文件的处理
 
+````c++
+int OfflineTransferTask::DoRecvData(uint32_t user_id, uint32_t offset, const char* data, uint32_t data_size)
+{
+    // 离线文件上传    
+    int rv = -1;
+    do {
+        // 检查是否发送者
+        if (!CheckFromUserID(user_id)) {
+            log("rsp user_id=%d, but sender_id is %d", user_id, from_user_id_);
+            break;
+        }
+        // 检查状态
+        if (state_ != kTransferTaskStateWaitingUpload && state_ != kTransferTaskStateUploading) {
+            log("state=%d error, need kTransferTaskStateWaitingUpload or kTransferTaskStateUploading", state_);
+            break;
+        }
+        // 检查offset是否有效
+        if (offset != transfered_idx_*SEGMENT_SIZE) {
+            break;
+        }
+        //if (data_size != GetNextSegmentBlockSize()) {
+        //    break;
+        //}
+        // todo
+        // 检查文件大小
+        data_size = GetNextSegmentBlockSize();
+        log("Ready recv data, offset=%d, data_size=%d, segment_size=%d", offset, data_size, sengment_size_);
+        if (state_ == kTransferTaskStateWaitingUpload) {
+            if (fp_ == NULL) {
+                fp_ = OpenByWrite(task_id_, to_user_id_);
+                if (fp_ == NULL) {
+                    break;
+                }
+            }
+            // 写文件头
+            OfflineFileHeader file_header;
+            memset(&file_header, 0, sizeof(file_header));
+            file_header.set_create_time(time(NULL));
+            file_header.set_task_id(task_id_);
+            file_header.set_from_user_id(from_user_id_);
+            file_header.set_to_user_id(to_user_id_);
+            file_header.set_file_name("");
+            file_header.set_file_size(file_size_);
+            fwrite(&file_header, 1, sizeof(file_header), fp_);
+            fflush(fp_);
+            state_ = kTransferTaskStateUploading;
+        }
+        // 存储
+        if (fp_ == NULL) {
+            //
+            break;
+        }
+        fwrite(data, 1, data_size, fp_);
+        fflush(fp_);
+        ++transfered_idx_;
+        SetLastUpdateTime();
+        if (transfered_idx_ == sengment_size_) {
+            state_ = kTransferTaskStateUploadEnd;
+            fclose(fp_);
+            fp_ = NULL;
+            rv = 1;
+        } else {
+            rv = 0;
+        }
+    } while (0);
+    return rv;
+}
+````
+
+
+
+
+
+#### 6 RouteServer路由服务器
+
+​		路由服务器主要实现的是不同MsgServer之间的消息转发，框架基本和之前的服务器类似。主要介绍的是路由的过程（路由消息处理）
+
+````c++
+void CRouteConn::HandlePdu(CImPdu* pPdu)//路由消息处理
+{
+	switch (pPdu->GetCommandId()) {
+        case CID_OTHER_HEARTBEAT://心跳
+            // do not take any action, heart beat only update m_last_recv_tick
+            break;
+        case CID_OTHER_ONLINE_USER_INFO://通知MsgServer用户登录的信息
+            _HandleOnlineUserInfo( pPdu );
+            break;
+        case CID_OTHER_USER_STATUS_UPDATE://通知MsgServer用户状态更新的消息，更新
+            _HandleUserStatusUpdate( pPdu );
+            break;
+        case CID_OTHER_ROLE_SET:
+            _HandleRoleSet( pPdu );
+            break;
+        case CID_BUDDY_LIST_USERS_STATUS_REQUEST://获取用户伙伴列表状态的请求
+            _HandleUsersStatusRequest( pPdu );
+            break;
+        case CID_MSG_DATA://这之后都是广播消息
+        case CID_SWITCH_P2P_CMD:
+        case CID_MSG_READ_NOTIFY:
+        case CID_OTHER_SERVER_KICK_USER:
+        case CID_GROUP_CHANGE_MEMBER_NOTIFY:
+        case CID_FILE_NOTIFY:
+        case CID_BUDDY_LIST_REMOVE_SESSION_NOTIFY:
+            _BroadcastMsg(pPdu, this);
+            break;
+        case CID_BUDDY_LIST_SIGN_INFO_CHANGED_NOTIFY:
+            _BroadcastMsg(pPdu);
+            break;
+	default:
+		log("CRouteConn::HandlePdu, wrong cmd id: %d ", pPdu->GetCommandId());
+		break;
+	}
+}
+````
+
+
+
+##### 6.1 消息广播
+
+````c++
+//遍历所有的连接，进行消息发送
+void CRouteConn::_BroadcastMsg(CImPdu* pPdu, CRouteConn* pFromConn)
+{
+	ConnMap_t::iterator it;
+	for (it = g_route_conn_map.begin(); it != g_route_conn_map.end(); it++) {
+		CRouteConn* pRouteConn = (CRouteConn*)it->second;
+		if (pRouteConn != pFromConn) {
+			pRouteConn->SendPdu(pPdu);
+		}
+	}
+}
+````
+
+
+
+##### 6.2 用户登录
+
+````c++
+//处理在线用户消息
+void CRouteConn::_HandleOnlineUserInfo(CImPdu* pPdu)
+{
+    IM::Server::IMOnlineUserInfo msg;
+    CHECK_PB_PARSE_MSG(msg.ParseFromArray(pPdu->GetBodyData(), pPdu->GetBodyLength()));//解析用户信息
+	uint32_t user_count = msg.user_stat_list_size();//获取用户状态列表
+	log("HandleOnlineUserInfo, user_cnt=%u ", user_count);
+	for (uint32_t i = 0; i < user_count; i++) {//遍历并更新用户状态
+        IM::BaseDefine::ServerUserStat server_user_stat = msg.user_stat_list(i);
+		_UpdateUserStatus(server_user_stat.user_id(), server_user_stat.status(), server_user_stat.client_type());
+	}
+}
+
+/*
+ * update user status info, the logic seems complex
+ */
+void CRouteConn::_UpdateUserStatus(uint32_t user_id, uint32_t status, uint32_t client_type)
+{
+    CUserInfo* pUser = GetUserInfo(user_id);
+    if (pUser) {
+        if (pUser->FindRouteConn(this))//找到用户连接
+        {
+            //若状态为离线，则删除连接
+            if (status == USER_STATUS_OFFLINE)
+            {
+                pUser->RemoveClientType(client_type);
+                if (pUser->IsMsgConnNULL())
+                {
+                    pUser->RemoveRouteConn(this);
+                    if (pUser->GetRouteConnCount() == 0) {
+                        delete pUser;
+                        pUser = NULL;
+                        g_user_map.erase(user_id);
+                    }
+                }
+            }
+            else
+            {
+                pUser->AddClientType(client_type);
+            }
+        }
+        else
+        {
+            if (status != USER_STATUS_OFFLINE)
+            {
+                pUser->AddRouteConn(this);
+                pUser->AddClientType(client_type);
+            }
+        }
+    }
+    else
+    {
+        if (status != USER_STATUS_OFFLINE) {
+            CUserInfo* pUserInfo = new CUserInfo();
+            if (pUserInfo != NULL) {
+                pUserInfo->AddRouteConn(this);
+                pUserInfo->AddClientType(client_type);
+                g_user_map.insert(make_pair(user_id, pUserInfo));
+            }
+            else
+            {
+                log("new UserInfo failed. ");
+            }
+        }
+    }
+}
+````
+
+##### 6.3 更新用户下信息
+
+````c++
+void CRouteConn::_HandleUserStatusUpdate(CImPdu* pPdu)
+{
+    IM::Server::IMUserStatusUpdate msg;
+    CHECK_PB_PARSE_MSG(msg.ParseFromArray(pPdu->GetBodyData(), pPdu->GetBodyLength()));//获取用户信息内容
+
+	uint32_t user_status = msg.user_status();
+	uint32_t user_id = msg.user_id();
+    uint32_t client_type = msg.client_type();
+	log("HandleUserStatusUpdate, status=%u, uid=%u, client_type=%u ", user_status, user_id, client_type);
+
+	_UpdateUserStatus(user_id, user_status, client_type);//更新用户状态
+    
+    //用于通知客户端,同一用户在pc端的登录情况
+    CUserInfo* pUser = GetUserInfo(user_id);
+    if (pUser)
+    {
+        IM::Server::IMServerPCLoginStatusNotify msg2;
+        msg2.set_user_id(user_id);
+        if (user_status == IM::BaseDefine::USER_STATUS_OFFLINE)
+        {
+            msg2.set_login_status(IM_PC_LOGIN_STATUS_OFF);
+        }
+        else
+        {
+            msg2.set_login_status(IM_PC_LOGIN_STATUS_ON);
+        }
+        CImPdu pdu;
+        pdu.SetPBMsg(&msg2);
+        pdu.SetServiceId(SID_OTHER);
+        pdu.SetCommandId(CID_OTHER_LOGIN_STATUS_NOTIFY);
+        
+        if (user_status == USER_STATUS_OFFLINE)
+        {
+            //pc端下线且无pc端存在，则给msg_server发送一个通知
+            if (CHECK_CLIENT_TYPE_PC(client_type) && !pUser->IsPCClientLogin())
+            {
+                _BroadcastMsg(&pdu);
+            }
+        }
+        else
+        {
+            //只要pc端在线，则不管上线的是pc还是移动端，都通知msg_server
+            if (pUser->IsPCClientLogin())
+            {
+                _BroadcastMsg(&pdu);
+            }
+        }
+    }
+    
+    //状态更新的是pc client端，则通知给所有其他人
+    if (CHECK_CLIENT_TYPE_PC(client_type))
+    {
+        IM::Buddy::IMUserStatNotify msg3;
+        IM::BaseDefine::UserStat* user_stat = msg3.mutable_user_stat();
+        user_stat->set_user_id(user_id);
+        user_stat->set_status((IM::BaseDefine::UserStatType)user_status);
+        CImPdu pdu2;
+        pdu2.SetPBMsg(&msg3);
+        pdu2.SetServiceId(SID_BUDDY_LIST);
+        pdu2.SetCommandId(CID_BUDDY_LIST_STATUS_NOTIFY);
+        
+        //用户存在
+        if (pUser)
+        {
+            //如果是pc客户端离线，但是仍然存在pc客户端，则不发送离线通知
+            //此种情况一般是pc客户端多点登录时引起
+            if (USER_STATUS_OFFLINE == user_status && pUser->IsPCClientLogin())
+            {
+                return;
+            }
+            else
+            {
+                _BroadcastMsg(&pdu2);
+            }
+        }
+        else//该用户不存在了，则表示是离线状态
+        {
+            _BroadcastMsg(&pdu2);
+        }
+    }
+}
+````
 
 
 
